@@ -178,23 +178,65 @@ async function ghPush(message) {
   if (!cfg.token || !cfg.user || !cfg.repo) return false;
   const path = cfg.path || ('data_' + currentUser + '.json');
   const branch = cfg.branch || 'main';
-  if (ghSha === null) {
-    const existing = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}`);
-    ghSha = existing ? existing.sha : null;
-  }
+
   state.lastModified = new Date().toISOString();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   saveUserData(currentUser, state);
-  const content = utf8ToB64(JSON.stringify(state, null, 2));
-  const body = { message: message || ('sync ' + new Date().toISOString()), content, branch };
-  if (ghSha) body.sha = ghSha;
-  const r = await ghFetch('PUT', `/repos/${cfg.user}/${cfg.repo}/contents/${path}`, body);
-  if (r && r.content) {
-    ghSha = r.content.sha;
-    cfg.lastSync = new Date().toLocaleString('ru-RU');
-    ghSaveCfg(cfg);
-    return true;
+
+  // до 3 попыток — при 409 перечитываем sha и мержим
+  for (let attempt = 0; attempt < 3; attempt++) {
+    // всегда берём свежий sha с сервера
+    let remote = null;
+    try {
+      remote = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}`);
+    } catch (e) { /* файла нет — создадим */ }
+
+    // мерж: если на сервере свежее — не перезаписываем
+    if (remote && remote.content) {
+      try {
+        const remoteData = JSON.parse(b64ToUtf8(remote.content));
+        const rt = new Date((remoteData && remoteData.lastModified) || 0).getTime();
+        const lt = new Date((state && state.lastModified) || 0).getTime();
+        if (rt > lt + 1000) {
+          // сервер новее — подтягиваем, а не перезаписываем
+          state = Object.assign(defaultState(), remoteData);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          saveUserData(currentUser, state);
+          if (typeof renderAll === 'function') renderAll();
+          if (typeof toast === 'function') toast('Данные обновлены с другого устройства', 'ok');
+          ghSha = remote.sha;
+          return false;
+        }
+      } catch (e) { /* ignore parse errors */ }
+      ghSha = remote.sha;
+    } else {
+      ghSha = null;
+    }
+
+    const content = utf8ToB64(JSON.stringify(state, null, 2));
+    const body = { message: message || ('sync ' + new Date().toISOString()), content, branch };
+    if (ghSha) body.sha = ghSha;
+
+    try {
+      const r = await ghFetch('PUT', `/repos/${cfg.user}/${cfg.repo}/contents/${path}`, body);
+      if (r && r.content) {
+        ghSha = r.content.sha;
+        cfg.lastSync = new Date().toLocaleString('ru-RU');
+        ghSaveCfg(cfg);
+        return true;
+      }
+    } catch (e) {
+      const msg = String(e && e.message || '');
+      if (msg.includes('409') || msg.includes('does not match')) {
+        // конфликт — повторяем, sha перечитается сверху
+        console.warn('gh push 409, retry', attempt + 1);
+        await new Promise(r => setTimeout(r, 400));
+        continue;
+      }
+      throw e;
+    }
   }
+  console.warn('gh push: max retries reached');
   return false;
 }
 
