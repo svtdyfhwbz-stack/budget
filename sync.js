@@ -1,6 +1,6 @@
 /* =============================================================
-   sync.js — Multi-account + session + GitHub sync + Mobile v3
-   v3: мгновенный push при сохранении транзакции
+   sync.js — Multi-account + session + GitHub sync + Mobile v4
+   v4: push на save/edit/delete + phone only simple mode + gear
    ============================================================= */
 (function () {
 'use strict';
@@ -260,7 +260,15 @@ function ghSchedulePush() {
   ghPushTimer = setTimeout(() => { if (ghCfg().token) ghPushNow('auto'); }, 2500 + Math.random() * 1500);
 }
 
-/* ---------- persist hook + immediate push ---------- */
+/* ---------- triggers ---------- */
+function triggerImmediatePush(reason) {
+  if (!currentUser) return;
+  const cfg = ghCfg();
+  if (!cfg.token || !cfg.user || !cfg.repo) return;
+  if (ghPushTimer) { clearTimeout(ghPushTimer); ghPushTimer = null; }
+  ghPushNow(reason || 'immediate');
+}
+
 function hookPersist() {
   if (typeof persist !== 'function') { setTimeout(hookPersist, 200); return; }
   if (persist.__ghHooked) return;
@@ -269,17 +277,27 @@ function hookPersist() {
     const r = await orig.call(this, options || {});
     if (currentUser) { try { saveUserData(currentUser, state); } catch (e) {} }
     if (options && options.skipSync) return r;
-    if (options && options.immediate) {
-      if (ghPushTimer) { clearTimeout(ghPushTimer); ghPushTimer = null; }
-      ghPushNow(options.reason || 'immediate');
-    } else {
-      ghSchedulePush();
-    }
+    if (options && options.immediate) triggerImmediatePush(options.reason || 'immediate');
+    else ghSchedulePush();
     return r;
   };
   window.persist.__ghHooked = true;
 }
 
+/* Hook deleteTx — после confirm и persist — мгновенный push */
+function hookDeleteTx() {
+  if (typeof window.deleteTx !== 'function') { setTimeout(hookDeleteTx, 300); return; }
+  if (window.deleteTx.__ghHooked) return;
+  const orig = window.deleteTx;
+  window.deleteTx = function (id) {
+    const r = orig.apply(this, arguments);
+    setTimeout(() => triggerImmediatePush('tx-delete'), 150);
+    return r;
+  };
+  window.deleteTx.__ghHooked = true;
+}
+
+/* Клики по кнопкам сохранения — мгновенный push */
 function setupImmediatePush() {
   if (setupImmediatePush.__wired) return;
   setupImmediatePush.__wired = true;
@@ -288,28 +306,23 @@ function setupImmediatePush() {
     const t = e.target;
     if (!t || !t.closest) return;
 
-    const saveTx = t.closest('#tx-save-btn');
-    const delTx  = t.closest('[onclick*="deleteTx"]');
-    const saveAcc = t.closest('#acc-save-btn');
-    const saveCat = t.closest('#cat-save-btn');
-    const saveSub = t.closest('#sub-save-btn');
+    const saveTx     = t.closest('#tx-save-btn');
+    const saveAcc    = t.closest('#acc-save-btn');
+    const saveCat    = t.closest('#cat-save-btn');
+    const saveSub    = t.closest('#sub-save-btn');
     const saveBudget = t.closest('#b-save-btn');
-    const saveGoal = t.closest('#g-save-btn');
+    const saveGoal   = t.closest('#g-save-btn');
+    const delBtn     = t.closest('[onclick*="deleteTx"]');
 
-    if (!saveTx && !delTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal) return;
+    if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !delBtn) return;
 
-    setTimeout(() => {
-      if (!currentUser) return;
-      const cfg = ghCfg();
-      if (!cfg.token || !cfg.user || !cfg.repo) return;
-      if (ghPushTimer) { clearTimeout(ghPushTimer); ghPushTimer = null; }
-      ghPushNow(saveTx || delTx ? 'tx' : 'data');
-    }, 200);
+    // 200 мс — даём index.html записать state и persist
+    setTimeout(() => triggerImmediatePush(saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data')), 200);
   }, false);
 }
 
 /* ============================================================
-   ACCOUNTS — нативная валюта
+   ACCOUNTS
    ============================================================ */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -354,7 +367,7 @@ function renderAccountsNative() {
 }
 
 /* ============================================================
-   TRANSACTIONS — карточки на телефоне
+   TRANSACTIONS mobile
    ============================================================ */
 function fmtDateShort(d) {
   try {
@@ -449,16 +462,16 @@ function renderTransactionsMobile() {
 }
 
 /* ============================================================
-   MOBILE MODE
+   MOBILE MODE — только простой вид, + маленькая ⚙ для настроек
    ============================================================ */
 function isMobileDevice() {
   if (window.matchMedia && window.matchMedia('(max-width: 760px)').matches) return true;
   return /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent);
 }
-function mobilePref() { return localStorage.getItem(MOBILE_MODE_KEY) || 'auto'; }
 function isMobileMode() {
   if (!isMobileDevice()) return false;
-  return mobilePref() !== 'off';
+  // на телефоне всегда простой вид. Отключается только через консоль
+  return localStorage.getItem(MOBILE_MODE_KEY) !== 'off';
 }
 function setMobileMode(on) {
   localStorage.setItem(MOBILE_MODE_KEY, on ? 'on' : 'off');
@@ -473,10 +486,17 @@ function injectMobileCSS() {
     body.mobile-mode .sidebar { display: none !important; }
     body.mobile-mode .main { padding: 12px 12px 110px; max-width: 100%; }
     body.mobile-mode .view { display: none !important; }
-    body.mobile-mode #view-transactions { display: block !important; }
+    body.mobile-mode #view-transactions.active { display: block !important; }
+    body.mobile-mode #view-settings.active {
+      display: block !important;
+      padding: 12px 12px 100px;
+    }
+    body.mobile-mode #view-settings .page-head { padding-right: 56px; }
+    body.mobile-mode #view-settings .page-head h1 { font-size: 20px; }
+    body.mobile-mode #view-settings .grid.two-col { grid-template-columns: 1fr !important; gap: 12px; }
     body.mobile-mode #view-transactions .page-head {
       display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 14px; padding-right: 120px; gap: 8px;
+      margin-bottom: 14px; padding-right: 56px; gap: 8px;
     }
     body.mobile-mode #view-transactions .page-head h1 { font-size: 20px; }
     body.mobile-mode #view-transactions .page-head .sub { display: none; }
@@ -559,17 +579,22 @@ function injectMobileCSS() {
     #mobile-fab.on { display: flex; }
     #mobile-fab:active { transform: scale(.94); }
 
-    #mobile-toggle {
+    #mobile-gear {
       position: fixed; right: 14px; top: 12px;
-      padding: 10px 16px; border-radius: 12px;
-      background: var(--bg-elev, #fff); color: var(--text, #2B2620);
+      width: 44px; height: 44px; border-radius: 50%;
+      background: var(--bg-elev, #fff); color: var(--text-dim, #968F80);
       border: 1px solid var(--border, #EAE2D3);
-      font-size: 13px; font-weight: 600; cursor: pointer;
+      font-size: 20px; line-height: 1; cursor: pointer;
       box-shadow: 0 3px 10px rgba(0,0,0,.08); z-index: 9001;
-      display: none; min-height: 44px;
+      display: none; align-items: center; justify-content: center;
+      padding: 0;
     }
-    #mobile-toggle.on { display: block; }
-    #mobile-toggle:active { transform: scale(.96); }
+    #mobile-gear.on { display: flex; }
+    #mobile-gear:active { transform: scale(.94); }
+    body.mobile-mode.show-settings #mobile-gear {
+      background: #F4A83D; color: #fff; border-color: #F4A83D;
+      font-size: 22px;
+    }
 
     @media (max-width: 760px) {
       .overlay { padding: 10px; align-items: flex-end !important; }
@@ -632,6 +657,7 @@ function injectMobileCSS() {
 }
 
 function injectMobileUI() {
+  // FAB — кнопка добавления
   if (!document.getElementById('mobile-fab')) {
     const fab = document.createElement('button');
     fab.id = 'mobile-fab';
@@ -641,12 +667,39 @@ function injectMobileUI() {
     fab.onclick = () => { if (typeof openTxModal === 'function') openTxModal(null); };
     document.body.appendChild(fab);
   }
-  if (!document.getElementById('mobile-toggle')) {
-    const btn = document.createElement('button');
-    btn.id = 'mobile-toggle';
-    btn.type = 'button';
-    btn.onclick = () => setMobileMode(!isMobileMode());
-    document.body.appendChild(btn);
+  // Gear — переход в настройки / назад
+  if (!document.getElementById('mobile-gear')) {
+    const gear = document.createElement('button');
+    gear.id = 'mobile-gear';
+    gear.type = 'button';
+    gear.textContent = '⚙';
+    gear.setAttribute('aria-label', 'Настройки');
+    gear.onclick = () => {
+      const settingsActive = document.getElementById('view-settings').classList.contains('active');
+      if (settingsActive) {
+        document.body.classList.remove('show-settings');
+        if (typeof showView === 'function') showView('transactions');
+      } else {
+        document.body.classList.add('show-settings');
+        if (typeof showView === 'function') showView('settings');
+      }
+      updateMobileChrome();
+    };
+    document.body.appendChild(gear);
+  }
+}
+
+function updateMobileChrome() {
+  const gear = document.getElementById('mobile-gear');
+  const fab = document.getElementById('mobile-fab');
+  if (!gear || !fab) return;
+  const settingsActive = document.getElementById('view-settings').classList.contains('active');
+  gear.textContent = settingsActive ? '←' : '⚙';
+  // FAB скрываем на странице настроек
+  if (settingsActive) {
+    fab.classList.remove('on');
+  } else {
+    fab.classList.add('on');
   }
 }
 
@@ -657,23 +710,25 @@ function applyMobileMode() {
   const mobile = isMobileDevice();
   document.body.classList.toggle('mobile-mode', on);
 
+  const gear = document.getElementById('mobile-gear');
   const fab = document.getElementById('mobile-fab');
-  const toggle = document.getElementById('mobile-toggle');
 
   if (!mobile) {
+    gear.classList.remove('on');
     fab.classList.remove('on');
-    toggle.classList.remove('on');
     return;
   }
-  fab.classList.add('on');
-  toggle.classList.add('on');
+  gear.classList.add('on');
 
   if (on) {
-    toggle.textContent = '⊞ Полный';
-    if (typeof showView === 'function') showView('transactions');
-  } else {
-    toggle.textContent = '⊞ Статистика';
+    if (typeof showView === 'function') {
+      const cur = document.querySelector('.view.active');
+      if (!cur) showView('transactions');
+    }
   }
+
+  // Пересобрать индекс кнопок в зависимости от активной вью
+  updateMobileChrome();
 }
 
 /* ============================================================
@@ -964,6 +1019,7 @@ function boot() {
 
   hideAuth();
   hookPersist();
+  hookDeleteTx();
   setupImmediatePush();
 
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
@@ -976,6 +1032,16 @@ function boot() {
   setInterval(() => {
     if (!document.getElementById('gh-sync-card')) injectGithubCard();
   }, 1500);
+
+  // подписаться на showView чтобы кнопка ⚙/← менялась
+  if (typeof window.showView === 'function' && !window.showView.__ghHooked) {
+    const origShow = window.showView;
+    window.showView = function (id) {
+      origShow.call(this, id);
+      setTimeout(updateMobileChrome, 30);
+    };
+    window.showView.__ghHooked = true;
+  }
 
   const c = ghCfg();
   if (c.token && c.user && c.repo) {
@@ -1008,7 +1074,11 @@ window.ghSync = {
   cfg: ghCfg,
   logout: logout,
   whoami: () => currentUser,
-  mobile: { on: () => setMobileMode(true), off: () => setMobileMode(false), state: isMobileMode }
+  mobile: {
+    state: isMobileMode,
+    off: () => setMobileMode(false),
+    on: () => setMobileMode(true)
+  }
 };
 
 })();
