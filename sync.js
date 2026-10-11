@@ -1,31 +1,34 @@
 /* =============================================================
-   sync.js — Multi-account + Persistent session + GitHub Sync
-   Требует index.html загруженным раньше: state, persist, renderAll,
-   toast, defaultState, STORAGE_KEY — доступны как глобальные let/const.
+   sync.js — Multi-account + session + GitHub sync (accounts too)
    ============================================================= */
 (function () {
 'use strict';
 
-const ACCOUNTS_KEY     = 'budget_accounts_v2';
-const SESSION_KEY      = 'budget_session_v2';
-const LOADED_USER_KEY  = 'budget_loaded_user_v2';
-const DATA_PREFIX      = 'budget_data_';
-const GH_PREFIX        = 'budget_gh_';
-const GH_API           = 'https://api.github.com';
+const ACCOUNTS_KEY    = 'budget_accounts_v2';
+const SESSION_KEY     = 'budget_session_v2';
+const LOADED_USER_KEY = 'budget_loaded_user_v2';
+const PENDING_GH_KEY  = 'budget_pending_gh_v1';
+const DATA_PREFIX     = 'budget_data_';
+const GH_PREFIX       = 'budget_gh_';
+const GH_API          = 'https://api.github.com';
+const ACCOUNTS_FILE   = 'accounts.json';
 
 let currentUser = null;
 let ghSha = null;
 let ghPushTimer = null;
+let ghAccountsTimer = null;
 let ghSyncing = false;
 let booted = false;
 
-/* ---------- storage helpers ---------- */
+/* ---------- storage ---------- */
 function accounts() {
   try { return JSON.parse(localStorage.getItem(ACCOUNTS_KEY) || '{}'); }
   catch { return {}; }
 }
-function saveAccounts(a) { localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(a)); }
-
+function saveAccounts(a) {
+  localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(a));
+  schedulePushAccounts();
+}
 function session() {
   try { return JSON.parse(localStorage.getItem(SESSION_KEY) || 'null'); }
   catch { return null; }
@@ -38,6 +41,14 @@ function loadedUser() { return localStorage.getItem(LOADED_USER_KEY) || null; }
 function setLoadedUser(u) {
   if (u) localStorage.setItem(LOADED_USER_KEY, u);
   else localStorage.removeItem(LOADED_USER_KEY);
+}
+function pendingGh() {
+  try { return JSON.parse(localStorage.getItem(PENDING_GH_KEY) || 'null'); }
+  catch { return null; }
+}
+function setPendingGh(v) {
+  if (v) localStorage.setItem(PENDING_GH_KEY, JSON.stringify(v));
+  else localStorage.removeItem(PENDING_GH_KEY);
 }
 
 function dataKey(u) { return DATA_PREFIX + u; }
@@ -81,12 +92,10 @@ function b64ToUtf8(b64) {
   return new TextDecoder().decode(bytes);
 }
 
-/* ---------- GitHub API ---------- */
-async function ghFetch(method, url, body) {
-  const cfg = ghCfg();
-  if (!cfg.token) throw new Error('Токен не задан');
+/* ---------- GH API (без текущего юзера — для bootstrap) ---------- */
+async function ghFetchRaw(method, url, body, token) {
   const headers = {
-    'Authorization': 'Bearer ' + cfg.token,
+    'Authorization': 'Bearer ' + token,
     'Accept': 'application/vnd.github.v3+json',
     'X-GitHub-Api-Version': '2022-11-28'
   };
@@ -103,10 +112,60 @@ async function ghFetch(method, url, body) {
   return r.json();
 }
 
+async function ghFetch(method, url, body) {
+  const cfg = ghCfg();
+  if (!cfg.token) throw new Error('Токен не задан');
+  return ghFetchRaw(method, url, body, cfg.token);
+}
+
+/* ---------- accounts.json sync ---------- */
+async function pushAccountsFile() {
+  const cfg = ghCfg();
+  if (!cfg.token || !cfg.user || !cfg.repo) return false;
+  const branch = cfg.branch || 'main';
+  let sha = null;
+  try {
+    const j = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}?ref=${branch}`);
+    sha = j ? j.sha : null;
+  } catch (e) { /* new file */ }
+  const content = utf8ToB64(JSON.stringify(accounts(), null, 2));
+  const body = { message: 'accounts sync', content, branch };
+  if (sha) body.sha = sha;
+  try {
+    const r = await ghFetch('PUT', `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}`, body);
+    return !!(r && r.content);
+  } catch (e) {
+    console.warn('pushAccountsFile error', e);
+    return false;
+  }
+}
+
+function schedulePushAccounts() {
+  if (!currentUser) return;
+  const cfg = ghCfg();
+  if (!cfg.token || !cfg.user || !cfg.repo) return;
+  if (ghAccountsTimer) clearTimeout(ghAccountsTimer);
+  ghAccountsTimer = setTimeout(pushAccountsFile, 1500);
+}
+
+async function pullAccountsFile(user, repo, token, branch) {
+  try {
+    const j = await ghFetchRaw('GET',
+      `/repos/${user}/${repo}/contents/${ACCOUNTS_FILE}?ref=${branch || 'main'}`,
+      null, token);
+    if (!j) return null;
+    return JSON.parse(b64ToUtf8(j.content));
+  } catch (e) {
+    console.warn('pullAccountsFile error', e);
+    return null;
+  }
+}
+
+/* ---------- data.json sync ---------- */
 async function ghPull() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return null;
-  const path = cfg.path || 'data.json';
+  const path = cfg.path || ('data_' + currentUser + '.json');
   const branch = cfg.branch || 'main';
   const j = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}`);
   if (!j) return null;
@@ -117,7 +176,7 @@ async function ghPull() {
 async function ghPush(message) {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return false;
-  const path = cfg.path || 'data.json';
+  const path = cfg.path || ('data_' + currentUser + '.json');
   const branch = cfg.branch || 'main';
   if (ghSha === null) {
     const existing = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}`);
@@ -187,17 +246,14 @@ function hookPersist() {
   const orig = persist;
   window.persist = async function (options) {
     const r = await orig.call(this, options || {});
-    // mirror to current user's dedicated slot
-    if (currentUser) {
-      try { saveUserData(currentUser, state); } catch (e) {}
-    }
+    if (currentUser) { try { saveUserData(currentUser, state); } catch (e) {} }
     if (!options || !options.skipSync) ghSchedulePush();
     return r;
   };
   window.persist.__ghHooked = true;
 }
 
-/* ---------- UI: auth screen ---------- */
+/* ---------- AUTH UI ---------- */
 function authHtml() {
   return `
   <div id="auth-screen" style="position:fixed;inset:0;background:var(--bg,#FAF7F2);z-index:99999;display:none;align-items:center;justify-content:center;padding:20px;overflow:auto;">
@@ -220,6 +276,7 @@ function authHtml() {
           <input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
         </div>
         <button id="li-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:12px 18px;border-radius:13px;font-weight:600;font-size:13.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);">Войти</button>
+        <button id="li-bootstrap" style="width:100%;background:transparent;color:#F4A83D;border:1px solid #F4A83D;padding:10px 18px;border-radius:13px;font-weight:600;font-size:12.5px;cursor:pointer;margin-top:10px;">Войти с другого устройства</button>
       </div>
 
       <div id="auth-register-form">
@@ -236,11 +293,39 @@ function authHtml() {
           <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
         </div>
         <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:12px 18px;border-radius:13px;font-weight:600;font-size:13.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);">Создать аккаунт</button>
+        <div style="font-size:11.5px;color:var(--text-dim,#968F80);text-align:center;margin-top:14px;line-height:1.5;">
+          После регистрации: Настройки → GitHub Sync → настройте токен,<br>тогда аккаунт появится на других устройствах.
+        </div>
       </div>
 
       <div id="auth-err" style="color:#F2545B;font-size:12.5px;margin-top:12px;text-align:center;min-height:16px;"></div>
-      <div style="color:var(--text-dim,#968F80);font-size:11.5px;text-align:center;margin-top:14px;line-height:1.5;">
-        Сессия хранится в этом браузере. Пароль не спросит, пока не нажмёшь «Выйти».
+    </div>
+
+    <div id="bootstrap-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100000;align-items:center;justify-content:center;padding:20px;">
+      <div style="background:var(--bg-elev,#fff);border-radius:22px;padding:26px;width:100%;max-width:380px;box-shadow:0 6px 20px rgba(43,38,32,.15);">
+        <h2 style="font-family:'Poppins','Segoe UI',sans-serif;font-size:19px;font-weight:700;margin-bottom:14px;color:var(--text,#2B2620);">Подключение с другого устройства</h2>
+        <p style="font-size:12.5px;color:var(--text-dim,#968F80);line-height:1.5;margin-bottom:14px;">Введите те же настройки GitHub, что и на первом устройстве. Скачаем список аккаунтов.</p>
+        <div style="margin-bottom:10px;">
+          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">GitHub username</label>
+          <input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+        </div>
+        <div style="margin-bottom:10px;">
+          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Репозиторий</label>
+          <input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+        </div>
+        <div style="margin-bottom:10px;">
+          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Ветка</label>
+          <input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+        </div>
+        <div style="margin-bottom:16px;">
+          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Token</label>
+          <input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+        </div>
+        <div id="bs-err" style="color:#F2545B;font-size:12.5px;margin-bottom:10px;min-height:14px;"></div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;">
+          <button id="bs-cancel" style="background:var(--bg-elev-2,#F2EDE3);color:var(--text,#2B2620);border:1px solid var(--border,#EAE2D3);padding:9px 16px;border-radius:11px;font-weight:600;font-size:13px;cursor:pointer;">Отмена</button>
+          <button id="bs-go" style="background:#F4A83D;color:#fff;border:none;padding:9px 16px;border-radius:11px;font-weight:600;font-size:13px;cursor:pointer;">Подключить</button>
+        </div>
       </div>
     </div>
   </div>`;
@@ -253,7 +338,6 @@ function injectAuth() {
   document.body.appendChild(wrap.firstElementChild);
   wireAuth();
 }
-
 function showAuth() {
   injectAuth();
   const el = document.getElementById('auth-screen');
@@ -295,7 +379,10 @@ function wireAuth() {
     err.textContent = '';
     if (!login || !pass) { err.textContent = 'Заполните логин и пароль'; return; }
     const accs = accounts();
-    if (!accs[login]) { err.textContent = 'Аккаунт не найден'; return; }
+    if (!accs[login]) {
+      err.textContent = 'Аккаунт не найден. Нажмите «Войти с другого устройства».';
+      return;
+    }
     const h = await sha256(login + ':' + pass);
     if (h !== accs[login].hash) { err.textContent = 'Неверный пароль'; return; }
     enterAccount(login);
@@ -316,25 +403,68 @@ function wireAuth() {
     const h = await sha256(login + ':' + p1);
     accs[login] = { hash: h, createdAt: new Date().toISOString() };
     saveAccounts(accs);
-    enterAccount(login);
+    enterAccount(login, true);
   };
 
   document.getElementById('li-submit').onclick = doLogin;
   document.getElementById('rg-submit').onclick = doRegister;
   document.getElementById('li-pass').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
   document.getElementById('rg-pass2').onkeydown = e => { if (e.key === 'Enter') doRegister(); };
+
+  // bootstrap new device
+  document.getElementById('li-bootstrap').onclick = () => {
+    document.getElementById('bootstrap-modal').style.display = 'flex';
+    document.getElementById('bs-err').textContent = '';
+    setTimeout(() => document.getElementById('bs-user').focus(), 50);
+  };
+  document.getElementById('bs-cancel').onclick = () => {
+    document.getElementById('bootstrap-modal').style.display = 'none';
+  };
+  document.getElementById('bs-go').onclick = async () => {
+    const user = document.getElementById('bs-user').value.trim();
+    const repo = document.getElementById('bs-repo').value.trim() || 'budget-data';
+    const branch = document.getElementById('bs-branch').value.trim() || 'main';
+    const token = document.getElementById('bs-token').value.trim();
+    const err = document.getElementById('bs-err');
+    err.textContent = '';
+    if (!user || !repo || !token) { err.textContent = 'Заполните все поля'; return; }
+    err.textContent = 'Подключение...';
+    const remote = await pullAccountsFile(user, repo, token, branch);
+    if (!remote || Object.keys(remote).length === 0) {
+      err.textContent = 'Не удалось загрузить accounts.json. Проверьте токен/репо.';
+      return;
+    }
+    const local = accounts();
+    const merged = Object.assign({}, remote, local);
+    localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(merged));
+    setPendingGh({ user, repo, token, branch });
+    err.style.color = '#2FBF71';
+    err.textContent = 'Готово! Войдите под своим логином.';
+    setTimeout(() => {
+      document.getElementById('bootstrap-modal').style.display = 'none';
+      document.getElementById('li-login').value = Object.keys(remote)[0] || '';
+      document.getElementById('li-pass').focus();
+    }, 800);
+  };
+
   setAuthTab('login');
 }
 
-function enterAccount(login) {
+function enterAccount(login, isNew) {
   currentUser = login;
   saveSession({ login, createdAt: new Date().toISOString() });
-  // if data for this user exists, swap into STORAGE_KEY and reload so index.html re-reads it
+
+  // apply pending GH config from bootstrap (if any)
+  const pending = pendingGh();
+  if (pending) {
+    ghSaveCfg(pending, login);
+    setPendingGh(null);
+  }
+
   const udata = loadUserData(login);
   if (udata) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
   } else {
-    // fresh account — start with default state
     try {
       const fresh = defaultState();
       localStorage.setItem(STORAGE_KEY, JSON.stringify(fresh));
@@ -346,10 +476,9 @@ function enterAccount(login) {
 }
 
 function logout() {
-  if (!confirm('Выйти из аккаунта? Данные останутся, пароль спросит снова при входе.')) return;
+  if (!confirm('Выйти из аккаунта? Данные останутся, пароль спросят при входе.')) return;
   saveSession(null);
   setLoadedUser(null);
-  // clear shared STORAGE_KEY so next visitor doesn't see old data
   try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
   location.reload();
 }
@@ -371,8 +500,8 @@ function injectGithubCard() {
   card.innerHTML = `
     <div class="stat-label" style="margin-bottom:12px;">Синхронизация с GitHub</div>
     <p style="font-size:12.5px;color:var(--text-dim);line-height:1.6;margin-bottom:14px;">
-      Данные этого аккаунта (<strong>${currentUser || '—'}</strong>) синхронизируются с приватным
-      репозиторием GitHub. Токен хранится только в этом браузере.
+      Аккаунт: <strong>${currentUser || '—'}</strong>. Данные и список аккаунтов синхронизируются
+      с приватным репозиторием. Токен хранится только в этом браузере.
     </p>
     <div class="field-row">
       <div class="field"><label>GitHub username</label>
@@ -381,10 +510,10 @@ function injectGithubCard() {
         <input type="text" id="gh-repo" value="${cfg.repo || 'budget-data'}" placeholder="budget-data"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>Файл</label>
-        <input type="text" id="gh-path" value="${cfg.path || 'data.json'}" placeholder="data.json"></div>
       <div class="field"><label>Ветка</label>
         <input type="text" id="gh-branch" value="${cfg.branch || 'main'}" placeholder="main"></div>
+      <div class="field"><label>Файл данных</label>
+        <input type="text" id="gh-path" value="${cfg.path || ('data_' + currentUser + '.json')}" placeholder="data.json"></div>
     </div>
     <div class="field"><label>Personal Access Token</label>
       <input type="password" id="gh-token" value="${cfg.token || ''}" placeholder="github_pat_...">
@@ -400,20 +529,25 @@ function injectGithubCard() {
   `;
   col.appendChild(card);
 
-  document.getElementById('gh-save').onclick = () => {
+  document.getElementById('gh-save').onclick = async () => {
     const c = ghCfg();
     c.user = document.getElementById('gh-user').value.trim();
     c.repo = document.getElementById('gh-repo').value.trim();
-    c.path = document.getElementById('gh-path').value.trim() || 'data.json';
     c.branch = document.getElementById('gh-branch').value.trim() || 'main';
+    c.path = document.getElementById('gh-path').value.trim() || ('data_' + currentUser + '.json');
     c.token = document.getElementById('gh-token').value.trim();
     ghSaveCfg(c);
     ghSha = null;
-    if (typeof toast === 'function') toast('Настройки синхронизации сохранены', 'ok');
-    ghPullAndMerge();
+    if (typeof toast === 'function') toast('Настройки сохранены', 'ok');
+    // push accounts + data
+    await pushAccountsFile();
+    await ghPullAndMerge();
     ghUpdateStatus();
   };
-  document.getElementById('gh-push').onclick = () => ghPushNow('manual');
+  document.getElementById('gh-push').onclick = async () => {
+    await pushAccountsFile();
+    ghPushNow('manual');
+  };
   document.getElementById('gh-pull').onclick = async () => {
     await ghPullAndMerge();
     if (typeof toast === 'function') toast('Загружено', 'ok');
@@ -441,27 +575,16 @@ function boot() {
   injectAuth();
 
   const s = session();
-  if (!s || !s.login) {
-    // no session → show login/register screen
-    showAuth();
-    return;
-  }
+  if (!s || !s.login) { showAuth(); return; }
   const accs = accounts();
-  if (!accs[s.login]) {
-    // account was deleted → force re-register
-    saveSession(null);
-    showAuth();
-    return;
-  }
+  if (!accs[s.login]) { saveSession(null); showAuth(); return; }
   currentUser = s.login;
 
-  // one-time swap: ensure STORAGE_KEY holds this user's data
   if (loadedUser() !== s.login) {
     const udata = loadUserData(s.login);
     if (udata) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
     } else {
-      // account exists but no data → use current STORAGE_KEY as their seed
       try { saveUserData(s.login, state); } catch (e) {}
     }
     setLoadedUser(s.login);
@@ -469,7 +592,6 @@ function boot() {
     return;
   }
 
-  // everything ready: hide auth, hook persist, inject GitHub card
   hideAuth();
   hookPersist();
   setTimeout(injectGithubCard, 400);
@@ -495,10 +617,10 @@ if (document.readyState === 'loading') {
   boot();
 }
 
-// debug helpers
 window.ghSync = {
   pull: ghPullAndMerge,
   push: () => ghPushNow('manual'),
+  pushAccounts: pushAccountsFile,
   status: ghUpdateStatus,
   cfg: ghCfg,
   logout: logout,
