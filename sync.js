@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — Multi-account + session + GitHub sync (atomic 409-safe)
+   sync.js — Multi-account + session + GitHub sync + Mobile mode
    ============================================================= */
 (function () {
 'use strict';
@@ -12,6 +12,7 @@ const DATA_PREFIX     = 'budget_data_';
 const GH_PREFIX       = 'budget_gh_';
 const GH_API          = 'https://api.github.com';
 const ACCOUNTS_FILE   = 'accounts.json';
+const MOBILE_MODE_KEY = 'budget_mobile_mode_v1';
 
 let currentUser = null;
 let ghSha = null;
@@ -116,40 +117,32 @@ async function ghFetch(method, url, body) {
   return ghFetchRaw(method, url, body, cfg.token);
 }
 
-/* ---------- atomic file write with retry ---------- */
+/* ---------- atomic file write ---------- */
 function parseCurrentSha(msg) {
   const m = String(msg || '').match(/is at ([0-9a-f]{40})/i);
   return m ? m[1] : null;
 }
-
 async function ghGetFile(path, cfg, rawToken) {
   const branch = cfg.branch || 'main';
   const url = `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}&cb=${Date.now()}-${Math.random()}`;
   try {
     if (rawToken) return await ghFetchRaw('GET', url, null, rawToken);
     return await ghFetch('GET', url);
-  } catch (e) {
-    return null;
-  }
+  } catch (e) { return null; }
 }
-
 async function ghAtomicPut(path, contentB64, message, cfg) {
   const branch = cfg.branch || 'main';
   const url = `/repos/${cfg.user}/${cfg.repo}/contents/${path}`;
   let shaHint = null;
-
   for (let attempt = 0; attempt < 6; attempt++) {
     let sha = shaHint;
     shaHint = null;
-
     if (!sha) {
       const j = await ghGetFile(path, cfg);
       if (j && j.sha) sha = j.sha;
     }
-
     const body = { message, content: contentB64, branch };
     if (sha) body.sha = sha;
-
     try {
       const r = await ghFetch('PUT', url, body);
       if (r && r.content) return { ok: true, sha: r.content.sha };
@@ -172,7 +165,7 @@ async function ghAtomicPut(path, contentB64, message, cfg) {
   return { ok: false };
 }
 
-/* ---------- accounts.json sync ---------- */
+/* ---------- accounts.json ---------- */
 async function pushAccountsFile() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return false;
@@ -199,7 +192,7 @@ async function pullAccountsFile(user, repo, token, branch) {
   }
 }
 
-/* ---------- data.json sync ---------- */
+/* ---------- data.json ---------- */
 async function ghPull() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return null;
@@ -209,7 +202,6 @@ async function ghPull() {
   try { return { data: JSON.parse(b64ToUtf8(j.content)), sha: j.sha }; }
   catch (e) { console.warn('ghPull parse error', e); return null; }
 }
-
 async function ghPush(message) {
   if (pushInFlight) { console.warn('push already in flight, skip'); return false; }
   pushInFlight = true;
@@ -217,12 +209,9 @@ async function ghPush(message) {
     const cfg = ghCfg();
     if (!cfg.token || !cfg.user || !cfg.repo) return false;
     const path = cfg.path || 'data.json';
-
     state.lastModified = new Date().toISOString();
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
     saveUserData(currentUser, state);
-
-    // pre-check: if server is newer — pull instead of push
     const remote = await ghGetFile(path, cfg);
     if (remote && remote.content) {
       try {
@@ -239,7 +228,6 @@ async function ghPush(message) {
         }
       } catch (e) {}
     }
-
     const content = utf8ToB64(JSON.stringify(state, null, 2));
     const msg = message || ('sync ' + new Date().toISOString());
     const res = await ghAtomicPut(path, content, msg, cfg);
@@ -254,7 +242,6 @@ async function ghPush(message) {
     pushInFlight = false;
   }
 }
-
 async function ghPullAndMerge() {
   if (ghSyncing) return;
   ghSyncing = true;
@@ -277,7 +264,6 @@ async function ghPullAndMerge() {
     ghSyncing = false;
   }
 }
-
 async function ghPushNow(message) {
   try {
     const ok = await ghPush(message);
@@ -288,10 +274,8 @@ async function ghPushNow(message) {
     if (typeof toast === 'function') toast('Ошибка синхронизации: ' + e.message, 'err');
   }
 }
-
 function ghSchedulePush() {
   if (ghPushTimer) clearTimeout(ghPushTimer);
-  // большая задержка + jitter — предотвращает шторм пушей
   ghPushTimer = setTimeout(() => {
     if (ghCfg().token) ghPushNow('auto');
   }, 5000 + Math.random() * 5000);
@@ -311,7 +295,184 @@ function hookPersist() {
   window.persist.__ghHooked = true;
 }
 
-/* ---------- AUTH UI ---------- */
+/* ============================================================
+   ACCOUNTS RE-RENDER — показ в родной валюте счёта
+   ============================================================ */
+function renderAccountsNative() {
+  const grid = document.getElementById('acc-grid');
+  if (!grid) return;
+  if (state.accounts.length === 0) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="big">＄</div>Пока нет счетов</div>`;
+    return;
+  }
+  const base = state.settings.baseCurrency;
+  const typeLabelFn = (typeof typeLabel === 'function') ? typeLabel : (t) => t;
+
+  grid.innerHTML = state.accounts.map(a => {
+    let nativeVal = 0, nativeCur = base;
+    if (a.type === 'cash' || a.type === 'bank') {
+      nativeVal = cashAccountBalance(a);
+      nativeCur = a.currency || base;
+    } else if (a.type === 'crypto') {
+      nativeVal = cryptoAccountValue(a);
+      nativeCur = (a.crypto && a.crypto.currency) || base;
+    } else if (a.type === 'stocks') {
+      nativeVal = stocksAccountValue(a);
+      nativeCur = a.currency || 'USD';
+    }
+    const baseVal = accountValue(a);
+    const showBase = nativeCur !== base;
+
+    let meta = '';
+    if (a.type === 'crypto') {
+      const addr = a.crypto && a.crypto.address;
+      meta = `${(a.crypto && a.crypto.network) || ''} · валюта: ${nativeCur} · `
+        + (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : 'адрес не указан')
+        + `<br>${a.crypto && a.crypto.lastUpdated ? 'обновлено ' + new Date(a.crypto.lastUpdated).toLocaleTimeString('ru-RU') : 'ещё не обновлялось'}`;
+    } else if (a.type === 'stocks') {
+      meta = `${(a.holdings || []).length} позиций · валюта: ${nativeCur}`;
+    } else {
+      meta = nativeCur;
+    }
+
+    return `<div class="acc-card" style="--c:${a.color}">
+      <div class="head">
+        <div><div class="name">${a.name}</div><div class="type">${typeLabelFn(a.type)}</div></div>
+        <div class="row-actions" style="opacity:1;">
+          <button class="icon-btn" onclick="openAccModal(accById('${a.id}'))">✎</button>
+          <button class="icon-btn" onclick="deleteAccount('${a.id}')">✕</button>
+        </div>
+      </div>
+      <div class="bal">${fmt(nativeVal, nativeCur)}</div>
+      ${showBase ? `<div class="meta" style="font-size:11.5px;color:var(--text-dim);margin-top:2px;">≈ ${fmt(baseVal)}</div>` : ''}
+      <div class="meta">${meta}</div>
+      <div class="foot">
+        ${a.type === 'crypto' ? `<button class="btn ghost small" onclick="refreshCrypto('${a.id}')">↻ Обновить курс</button>` : ''}
+        ${a.type === 'stocks' ? `<button class="btn ghost small" onclick="showView('stocks')">Портфель →</button>` : '<span></span>'}
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* ============================================================
+   MOBILE MODE
+   ============================================================ */
+function isMobileDevice() {
+  if (window.matchMedia && window.matchMedia('(max-width: 760px)').matches) return true;
+  return /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent);
+}
+function mobilePref() { return localStorage.getItem(MOBILE_MODE_KEY) || 'auto'; }
+function isMobileMode() {
+  if (!isMobileDevice()) return false;
+  return mobilePref() !== 'off';
+}
+function setMobileMode(on) {
+  localStorage.setItem(MOBILE_MODE_KEY, on ? 'on' : 'off');
+  applyMobileMode();
+}
+
+function injectMobileCSS() {
+  if (document.getElementById('mobile-mode-css')) return;
+  const style = document.createElement('style');
+  style.id = 'mobile-mode-css';
+  style.textContent = `
+    body.mobile-mode .sidebar { display: none !important; }
+    body.mobile-mode .main { padding: 14px 12px 100px; max-width: 100%; }
+    body.mobile-mode .view { display: none !important; }
+    body.mobile-mode #view-transactions { display: block !important; }
+    body.mobile-mode #view-transactions .page-head {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 12px; padding-right: 110px;
+    }
+    body.mobile-mode #view-transactions .page-head h1 { font-size: 18px; }
+    body.mobile-mode #view-transactions .page-head .sub { display: none; }
+    body.mobile-mode #view-transactions #add-tx-btn { display: none !important; }
+    body.mobile-mode #view-transactions .card { border-radius: 14px; padding: 10px; }
+    body.mobile-mode #tx-table th:nth-child(2),
+    body.mobile-mode #tx-table th:nth-child(4),
+    body.mobile-mode #tx-table td:nth-child(2),
+    body.mobile-mode #tx-table td:nth-child(4) { display: none; }
+    body.mobile-mode #tx-table td,
+    body.mobile-mode #tx-table th { padding: 8px 6px; font-size: 12.5px; }
+    body.mobile-mode #tx-table .row-actions { opacity: 1; }
+
+    #mobile-fab {
+      position: fixed; right: 18px; bottom: 22px;
+      width: 60px; height: 60px; border-radius: 50%;
+      background: #F4A83D; color: #fff; border: none;
+      font-size: 32px; line-height: 1; font-weight: 300;
+      box-shadow: 0 6px 20px rgba(244,168,61,.45);
+      cursor: pointer; z-index: 9000;
+      align-items: center; justify-content: center;
+      display: none;
+    }
+    #mobile-fab.on { display: flex; }
+    #mobile-fab:active { transform: scale(.94); }
+
+    #mobile-toggle {
+      position: fixed; right: 18px; top: 14px;
+      padding: 8px 14px; border-radius: 12px;
+      background: var(--bg-elev, #fff); color: var(--text, #2B2620);
+      border: 1px solid var(--border, #EAE2D3);
+      font-size: 12.5px; font-weight: 600; cursor: pointer;
+      box-shadow: 0 3px 10px rgba(0,0,0,.06); z-index: 9000;
+      display: none;
+    }
+    #mobile-toggle.on { display: block; }
+  `;
+  document.head.appendChild(style);
+}
+
+function injectMobileUI() {
+  if (!document.getElementById('mobile-fab')) {
+    const fab = document.createElement('button');
+    fab.id = 'mobile-fab';
+    fab.type = 'button';
+    fab.textContent = '+';
+    fab.setAttribute('aria-label', 'Добавить операцию');
+    fab.onclick = () => {
+      if (typeof openTxModal === 'function') openTxModal(null);
+    };
+    document.body.appendChild(fab);
+  }
+  if (!document.getElementById('mobile-toggle')) {
+    const btn = document.createElement('button');
+    btn.id = 'mobile-toggle';
+    btn.type = 'button';
+    btn.onclick = () => setMobileMode(!isMobileMode());
+    document.body.appendChild(btn);
+  }
+}
+
+function applyMobileMode() {
+  injectMobileCSS();
+  injectMobileUI();
+  const on = isMobileMode();
+  const mobile = isMobileDevice();
+  document.body.classList.toggle('mobile-mode', on);
+
+  const fab = document.getElementById('mobile-fab');
+  const toggle = document.getElementById('mobile-toggle');
+
+  if (!mobile) {
+    fab.classList.remove('on');
+    toggle.classList.remove('on');
+    return;
+  }
+  fab.classList.add('on');
+  toggle.classList.add('on');
+
+  if (on) {
+    toggle.textContent = '⊞ Полный';
+    if (typeof showView === 'function') showView('transactions');
+  } else {
+    toggle.textContent = '⊞ Статистика';
+  }
+}
+
+/* ============================================================
+   AUTH UI
+   ============================================================ */
 function authHtml() {
   return `
   <div id="auth-screen" style="position:fixed;inset:0;background:var(--bg,#FAF7F2);z-index:99999;display:none;align-items:center;justify-content:center;padding:20px;overflow:auto;">
@@ -511,13 +672,11 @@ function wireAuth() {
 function enterAccount(login, isNew) {
   currentUser = login;
   saveSession({ login, createdAt: new Date().toISOString() });
-
   const pending = pendingGh();
   if (pending) {
     ghSaveCfg(pending, login);
     setPendingGh(null);
   }
-
   const udata = loadUserData(login);
   if (udata) {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
@@ -650,6 +809,16 @@ function boot() {
 
   hideAuth();
   hookPersist();
+
+  // подменяем рендер счетов на версию с нативной валютой
+  try { window.renderAccounts = renderAccountsNative; } catch (e) {}
+  if (typeof renderAll === 'function') {
+    try { renderAll(); } catch (e) {}
+  }
+
+  // мобильный режим
+  setTimeout(() => { applyMobileMode(); }, 250);
+
   setTimeout(injectGithubCard, 400);
   setInterval(() => {
     if (!document.getElementById('gh-sync-card')) injectGithubCard();
@@ -665,6 +834,14 @@ function boot() {
       if (document.visibilityState === 'visible') ghPullAndMerge();
     });
   }
+
+  // ресайз — пересчёт мобильного режима
+  let rzTimer = null;
+  window.addEventListener('resize', () => {
+    if (rzTimer) clearTimeout(rzTimer);
+    rzTimer = setTimeout(applyMobileMode, 200);
+  });
+  window.addEventListener('orientationchange', applyMobileMode);
 }
 
 if (document.readyState === 'loading') {
@@ -680,7 +857,8 @@ window.ghSync = {
   status: ghUpdateStatus,
   cfg: ghCfg,
   logout: logout,
-  whoami: () => currentUser
+  whoami: () => currentUser,
+  mobile: { on: () => setMobileMode(true), off: () => setMobileMode(false), state: isMobileMode }
 };
 
 })();
