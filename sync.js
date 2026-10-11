@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — Multi-account + session + GitHub sync (409-safe)
+   sync.js — Multi-account + session + GitHub sync (409/422-safe)
    Требует index.html загруженным раньше: state, persist, renderAll,
    toast, defaultState, STORAGE_KEY — доступны как глобальные.
    ============================================================= */
@@ -120,36 +120,46 @@ async function ghFetch(method, url, body) {
   return ghFetchRaw(method, url, body, cfg.token);
 }
 
-/* ---------- accounts.json sync ---------- */
+/* ---------- accounts.json sync (422-safe) ---------- */
 async function pushAccountsFile() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return false;
   const branch = cfg.branch || 'main';
-  let sha = null;
-  try {
-    const j = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}?ref=${branch}`);
-    sha = j ? j.sha : null;
-  } catch (e) { /* new file */ }
   const content = utf8ToB64(JSON.stringify(accounts(), null, 2));
-  const body = { message: 'accounts sync', content, branch };
-  if (sha) body.sha = sha;
-  try {
-    const r = await ghFetch('PUT', `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}`, body);
-    return !!(r && r.content);
-  } catch (e) {
-    // 409 — перечитаем sha и повторим один раз
-    if (String(e.message).includes('409') || String(e.message).includes('does not match')) {
-      try {
-        const j2 = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}?ref=${branch}`);
-        const body2 = { message: 'accounts sync', content, branch };
-        if (j2 && j2.sha) body2.sha = j2.sha;
-        const r2 = await ghFetch('PUT', `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}`, body2);
-        return !!(r2 && r2.content);
-      } catch (e2) { console.warn('pushAccountsFile retry failed', e2); return false; }
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    let sha = null;
+    try {
+      const j = await ghFetch('GET',
+        `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}?ref=${branch}&t=${Date.now()}`);
+      if (j && j.sha) sha = j.sha;
+    } catch (e) {
+      console.warn('accounts GET attempt', attempt, e.message);
     }
-    console.warn('pushAccountsFile error', e);
-    return false;
+
+    const body = { message: 'accounts sync', content, branch };
+    if (sha) body.sha = sha;
+
+    try {
+      const r = await ghFetch('PUT',
+        `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}`, body);
+      if (r && r.content) return true;
+    } catch (e) {
+      const msg = String((e && e.message) || '');
+      const retryable = msg.includes('409') || msg.includes('422') ||
+                        msg.includes('does not match') ||
+                        msg.includes("sha wasn't supplied");
+      if (retryable) {
+        console.warn('accounts push conflict, retry', attempt, msg.slice(0, 120));
+        await new Promise(r => setTimeout(r, 400 + attempt * 500));
+        continue;
+      }
+      console.warn('pushAccountsFile error', e);
+      return false;
+    }
   }
+  console.warn('pushAccountsFile: max retries');
+  return false;
 }
 
 function schedulePushAccounts() {
@@ -163,7 +173,7 @@ function schedulePushAccounts() {
 async function pullAccountsFile(user, repo, token, branch) {
   try {
     const j = await ghFetchRaw('GET',
-      `/repos/${user}/${repo}/contents/${ACCOUNTS_FILE}?ref=${branch || 'main'}`,
+      `/repos/${user}/${repo}/contents/${ACCOUNTS_FILE}?ref=${branch || 'main'}&t=${Date.now()}`,
       null, token);
     if (!j) return null;
     return JSON.parse(b64ToUtf8(j.content));
@@ -173,13 +183,14 @@ async function pullAccountsFile(user, repo, token, branch) {
   }
 }
 
-/* ---------- data.json sync (409-safe) ---------- */
+/* ---------- data.json sync (409/422-safe) ---------- */
 async function ghPull() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return null;
   const path = cfg.path || 'data.json';
   const branch = cfg.branch || 'main';
-  const j = await ghFetch('GET', `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}`);
+  const j = await ghFetch('GET',
+    `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}&t=${Date.now()}`);
   if (!j) return null;
   try { return { data: JSON.parse(b64ToUtf8(j.content)), sha: j.sha }; }
   catch (e) { console.warn('ghPull parse error', e); return null; }
@@ -195,20 +206,18 @@ async function ghPush(message) {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
   saveUserData(currentUser, state);
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    // 1. всегда забираем свежий SHA с сервера
+  for (let attempt = 0; attempt < 4; attempt++) {
     let serverSha = null;
     let serverData = null;
     try {
       const j = await ghFetch('GET',
-        `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}`);
+        `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}&t=${Date.now()}`);
       if (j && j.content) {
         serverSha = j.sha;
         try { serverData = JSON.parse(b64ToUtf8(j.content)); } catch (e) {}
       }
-    } catch (e) { /* файл ещё не создан */ }
+    } catch (e) { /* файла нет — создадим */ }
 
-    // 2. если на сервере свежее — подтягиваем
     if (serverData) {
       const rt = new Date(serverData.lastModified || 0).getTime();
       const lt = new Date(state.lastModified || 0).getTime();
@@ -223,7 +232,6 @@ async function ghPush(message) {
       }
     }
 
-    // 3. PUT
     const content = utf8ToB64(JSON.stringify(state, null, 2));
     const body = { message: message || ('sync ' + new Date().toISOString()), content, branch };
     if (serverSha) body.sha = serverSha;
@@ -239,8 +247,10 @@ async function ghPush(message) {
       }
     } catch (e) {
       const msg = String((e && e.message) || '');
-      if (msg.includes('409') || msg.includes('does not match')) {
-        console.warn('409 retry', attempt);
+      if (msg.includes('409') || msg.includes('422') ||
+          msg.includes('does not match') ||
+          msg.includes("sha wasn't supplied")) {
+        console.warn('push conflict, retry', attempt, msg.slice(0, 120));
         await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
         continue;
       }
