@@ -1,7 +1,5 @@
 /* =============================================================
-   sync.js — Multi-account + session + GitHub sync (409/422-safe)
-   Требует index.html загруженным раньше: state, persist, renderAll,
-   toast, defaultState, STORAGE_KEY — доступны как глобальные.
+   sync.js — Multi-account + session + GitHub sync (atomic 409-safe)
    ============================================================= */
 (function () {
 'use strict';
@@ -21,6 +19,7 @@ let ghPushTimer = null;
 let ghAccountsTimer = null;
 let ghSyncing = false;
 let booted = false;
+let pushInFlight = false;
 
 /* ---------- storage ---------- */
 function accounts() {
@@ -52,10 +51,8 @@ function setPendingGh(v) {
   if (v) localStorage.setItem(PENDING_GH_KEY, JSON.stringify(v));
   else localStorage.removeItem(PENDING_GH_KEY);
 }
-
 function dataKey(u) { return DATA_PREFIX + u; }
 function ghKey(u)   { return GH_PREFIX + u; }
-
 function loadUserData(u) {
   try { return JSON.parse(localStorage.getItem(dataKey(u)) || 'null'); }
   catch { return null; }
@@ -109,72 +106,91 @@ async function ghFetchRaw(method, url, body, token) {
   if (r.status === 404) return null;
   if (!r.ok) {
     const txt = await r.text().catch(() => '');
-    throw new Error('GitHub ' + r.status + ': ' + txt.slice(0, 200));
+    throw new Error('GitHub ' + r.status + ': ' + txt.slice(0, 300));
   }
   return r.json();
 }
-
 async function ghFetch(method, url, body) {
   const cfg = ghCfg();
   if (!cfg.token) throw new Error('Токен не задан');
   return ghFetchRaw(method, url, body, cfg.token);
 }
 
-/* ---------- accounts.json sync (422-safe) ---------- */
-async function pushAccountsFile() {
-  const cfg = ghCfg();
-  if (!cfg.token || !cfg.user || !cfg.repo) return false;
-  const branch = cfg.branch || 'main';
-  const content = utf8ToB64(JSON.stringify(accounts(), null, 2));
+/* ---------- atomic file write with retry ---------- */
+function parseCurrentSha(msg) {
+  const m = String(msg || '').match(/is at ([0-9a-f]{40})/i);
+  return m ? m[1] : null;
+}
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let sha = null;
-    try {
-      const j = await ghFetch('GET',
-        `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}?ref=${branch}&t=${Date.now()}`);
+async function ghGetFile(path, cfg, rawToken) {
+  const branch = cfg.branch || 'main';
+  const url = `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}&cb=${Date.now()}-${Math.random()}`;
+  try {
+    if (rawToken) return await ghFetchRaw('GET', url, null, rawToken);
+    return await ghFetch('GET', url);
+  } catch (e) {
+    return null;
+  }
+}
+
+async function ghAtomicPut(path, contentB64, message, cfg) {
+  const branch = cfg.branch || 'main';
+  const url = `/repos/${cfg.user}/${cfg.repo}/contents/${path}`;
+  let shaHint = null;
+
+  for (let attempt = 0; attempt < 6; attempt++) {
+    let sha = shaHint;
+    shaHint = null;
+
+    if (!sha) {
+      const j = await ghGetFile(path, cfg);
       if (j && j.sha) sha = j.sha;
-    } catch (e) {
-      console.warn('accounts GET attempt', attempt, e.message);
     }
 
-    const body = { message: 'accounts sync', content, branch };
+    const body = { message, content: contentB64, branch };
     if (sha) body.sha = sha;
 
     try {
-      const r = await ghFetch('PUT',
-        `/repos/${cfg.user}/${cfg.repo}/contents/${ACCOUNTS_FILE}`, body);
-      if (r && r.content) return true;
+      const r = await ghFetch('PUT', url, body);
+      if (r && r.content) return { ok: true, sha: r.content.sha };
     } catch (e) {
       const msg = String((e && e.message) || '');
-      const retryable = msg.includes('409') || msg.includes('422') ||
-                        msg.includes('does not match') ||
-                        msg.includes("sha wasn't supplied");
-      if (retryable) {
-        console.warn('accounts push conflict, retry', attempt, msg.slice(0, 120));
-        await new Promise(r => setTimeout(r, 400 + attempt * 500));
+      const isConflict = msg.includes('409') || msg.includes('422') ||
+                         msg.includes('does not match') ||
+                         msg.includes("sha wasn't supplied");
+      if (isConflict) {
+        shaHint = parseCurrentSha(msg);
+        const wait = 400 * Math.pow(1.6, attempt) + Math.random() * 900;
+        console.warn('atomic put conflict #' + attempt, 'hint=' + shaHint, 'wait=' + Math.round(wait));
+        await new Promise(r => setTimeout(r, wait));
         continue;
       }
-      console.warn('pushAccountsFile error', e);
-      return false;
+      throw e;
     }
   }
-  console.warn('pushAccountsFile: max retries');
-  return false;
+  console.warn('atomic put: max retries for ' + path);
+  return { ok: false };
 }
 
+/* ---------- accounts.json sync ---------- */
+async function pushAccountsFile() {
+  const cfg = ghCfg();
+  if (!cfg.token || !cfg.user || !cfg.repo) return false;
+  const content = utf8ToB64(JSON.stringify(accounts(), null, 2));
+  const res = await ghAtomicPut(ACCOUNTS_FILE, content, 'accounts sync', cfg);
+  return !!res.ok;
+}
 function schedulePushAccounts() {
   if (!currentUser) return;
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return;
   if (ghAccountsTimer) clearTimeout(ghAccountsTimer);
-  ghAccountsTimer = setTimeout(pushAccountsFile, 1500);
+  ghAccountsTimer = setTimeout(pushAccountsFile, 3000 + Math.random() * 3000);
 }
-
 async function pullAccountsFile(user, repo, token, branch) {
   try {
-    const j = await ghFetchRaw('GET',
-      `/repos/${user}/${repo}/contents/${ACCOUNTS_FILE}?ref=${branch || 'main'}&t=${Date.now()}`,
-      null, token);
+    const url = `/repos/${user}/${repo}/contents/${ACCOUNTS_FILE}?ref=${branch || 'main'}&cb=${Date.now()}`;
+    const j = await ghFetchRaw('GET', url, null, token);
     if (!j) return null;
     return JSON.parse(b64ToUtf8(j.content));
   } catch (e) {
@@ -183,82 +199,60 @@ async function pullAccountsFile(user, repo, token, branch) {
   }
 }
 
-/* ---------- data.json sync (409/422-safe) ---------- */
+/* ---------- data.json sync ---------- */
 async function ghPull() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return null;
   const path = cfg.path || 'data.json';
-  const branch = cfg.branch || 'main';
-  const j = await ghFetch('GET',
-    `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}&t=${Date.now()}`);
+  const j = await ghGetFile(path, cfg);
   if (!j) return null;
   try { return { data: JSON.parse(b64ToUtf8(j.content)), sha: j.sha }; }
   catch (e) { console.warn('ghPull parse error', e); return null; }
 }
 
 async function ghPush(message) {
-  const cfg = ghCfg();
-  if (!cfg.token || !cfg.user || !cfg.repo) return false;
-  const path = cfg.path || 'data.json';
-  const branch = cfg.branch || 'main';
+  if (pushInFlight) { console.warn('push already in flight, skip'); return false; }
+  pushInFlight = true;
+  try {
+    const cfg = ghCfg();
+    if (!cfg.token || !cfg.user || !cfg.repo) return false;
+    const path = cfg.path || 'data.json';
 
-  state.lastModified = new Date().toISOString();
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-  saveUserData(currentUser, state);
+    state.lastModified = new Date().toISOString();
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+    saveUserData(currentUser, state);
 
-  for (let attempt = 0; attempt < 4; attempt++) {
-    let serverSha = null;
-    let serverData = null;
-    try {
-      const j = await ghFetch('GET',
-        `/repos/${cfg.user}/${cfg.repo}/contents/${path}?ref=${branch}&t=${Date.now()}`);
-      if (j && j.content) {
-        serverSha = j.sha;
-        try { serverData = JSON.parse(b64ToUtf8(j.content)); } catch (e) {}
-      }
-    } catch (e) { /* файла нет — создадим */ }
-
-    if (serverData) {
-      const rt = new Date(serverData.lastModified || 0).getTime();
-      const lt = new Date(state.lastModified || 0).getTime();
-      if (rt > lt + 2000) {
-        state = Object.assign(defaultState(), serverData);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-        saveUserData(currentUser, state);
-        if (typeof renderAll === 'function') renderAll();
-        if (typeof toast === 'function') toast('Данные с сервера свежее — загружены', 'ok');
-        ghSha = serverSha;
-        return false;
-      }
+    // pre-check: if server is newer — pull instead of push
+    const remote = await ghGetFile(path, cfg);
+    if (remote && remote.content) {
+      try {
+        const serverData = JSON.parse(b64ToUtf8(remote.content));
+        const rt = new Date(serverData.lastModified || 0).getTime();
+        const lt = new Date(state.lastModified || 0).getTime();
+        if (rt > lt + 3000) {
+          state = Object.assign(defaultState(), serverData);
+          localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+          saveUserData(currentUser, state);
+          if (typeof renderAll === 'function') renderAll();
+          if (typeof toast === 'function') toast('Данные с сервера свежее — загружены', 'ok');
+          return false;
+        }
+      } catch (e) {}
     }
 
     const content = utf8ToB64(JSON.stringify(state, null, 2));
-    const body = { message: message || ('sync ' + new Date().toISOString()), content, branch };
-    if (serverSha) body.sha = serverSha;
-
-    try {
-      const r = await ghFetch('PUT',
-        `/repos/${cfg.user}/${cfg.repo}/contents/${path}`, body);
-      if (r && r.content) {
-        ghSha = r.content.sha;
-        cfg.lastSync = new Date().toLocaleString('ru-RU');
-        ghSaveCfg(cfg);
-        return true;
-      }
-    } catch (e) {
-      const msg = String((e && e.message) || '');
-      if (msg.includes('409') || msg.includes('422') ||
-          msg.includes('does not match') ||
-          msg.includes("sha wasn't supplied")) {
-        console.warn('push conflict, retry', attempt, msg.slice(0, 120));
-        await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
-        continue;
-      }
-      throw e;
+    const msg = message || ('sync ' + new Date().toISOString());
+    const res = await ghAtomicPut(path, content, msg, cfg);
+    if (res.ok) {
+      ghSha = res.sha;
+      cfg.lastSync = new Date().toLocaleString('ru-RU');
+      ghSaveCfg(cfg);
+      return true;
     }
+    return false;
+  } finally {
+    pushInFlight = false;
   }
-  console.warn('gh push: max retries');
-  return false;
 }
 
 async function ghPullAndMerge() {
@@ -297,9 +291,10 @@ async function ghPushNow(message) {
 
 function ghSchedulePush() {
   if (ghPushTimer) clearTimeout(ghPushTimer);
+  // большая задержка + jitter — предотвращает шторм пушей
   ghPushTimer = setTimeout(() => {
     if (ghCfg().token) ghPushNow('auto');
-  }, 2500);
+  }, 5000 + Math.random() * 5000);
 }
 
 /* ---------- persist hook ---------- */
