@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — Multi-account + session + GitHub sync + Mobile mode
+   sync.js — Multi-account + GitHub sync + Mobile mode v2
    ============================================================= */
 (function () {
 'use strict';
@@ -60,7 +60,7 @@ function loadUserData(u) {
 }
 function saveUserData(u, data) {
   try { localStorage.setItem(dataKey(u), JSON.stringify(data)); }
-  catch (e) { console.warn('saveUserData failed', e); }
+  catch (e) {}
 }
 function ghCfg(u) {
   u = u || currentUser;
@@ -101,8 +101,7 @@ async function ghFetchRaw(method, url, body, token) {
   };
   if (body) headers['Content-Type'] = 'application/json';
   const r = await fetch(GH_API + url, {
-    method, headers,
-    body: body ? JSON.stringify(body) : undefined
+    method, headers, body: body ? JSON.stringify(body) : undefined
   });
   if (r.status === 404) return null;
   if (!r.ok) {
@@ -116,8 +115,6 @@ async function ghFetch(method, url, body) {
   if (!cfg.token) throw new Error('Токен не задан');
   return ghFetchRaw(method, url, body, cfg.token);
 }
-
-/* ---------- atomic file write ---------- */
 function parseCurrentSha(msg) {
   const m = String(msg || '').match(/is at ([0-9a-f]{40})/i);
   return m ? m[1] : null;
@@ -135,8 +132,7 @@ async function ghAtomicPut(path, contentB64, message, cfg) {
   const url = `/repos/${cfg.user}/${cfg.repo}/contents/${path}`;
   let shaHint = null;
   for (let attempt = 0; attempt < 6; attempt++) {
-    let sha = shaHint;
-    shaHint = null;
+    let sha = shaHint; shaHint = null;
     if (!sha) {
       const j = await ghGetFile(path, cfg);
       if (j && j.sha) sha = j.sha;
@@ -153,19 +149,16 @@ async function ghAtomicPut(path, contentB64, message, cfg) {
                          msg.includes("sha wasn't supplied");
       if (isConflict) {
         shaHint = parseCurrentSha(msg);
-        const wait = 400 * Math.pow(1.6, attempt) + Math.random() * 900;
-        console.warn('atomic put conflict #' + attempt, 'hint=' + shaHint, 'wait=' + Math.round(wait));
-        await new Promise(r => setTimeout(r, wait));
+        await new Promise(r => setTimeout(r, 400 * Math.pow(1.6, attempt) + Math.random() * 900));
         continue;
       }
       throw e;
     }
   }
-  console.warn('atomic put: max retries for ' + path);
   return { ok: false };
 }
 
-/* ---------- accounts.json ---------- */
+/* ---------- accounts.json / data.json ---------- */
 async function pushAccountsFile() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return false;
@@ -186,13 +179,8 @@ async function pullAccountsFile(user, repo, token, branch) {
     const j = await ghFetchRaw('GET', url, null, token);
     if (!j) return null;
     return JSON.parse(b64ToUtf8(j.content));
-  } catch (e) {
-    console.warn('pullAccountsFile error', e);
-    return null;
-  }
+  } catch (e) { return null; }
 }
-
-/* ---------- data.json ---------- */
 async function ghPull() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return null;
@@ -200,10 +188,10 @@ async function ghPull() {
   const j = await ghGetFile(path, cfg);
   if (!j) return null;
   try { return { data: JSON.parse(b64ToUtf8(j.content)), sha: j.sha }; }
-  catch (e) { console.warn('ghPull parse error', e); return null; }
+  catch (e) { return null; }
 }
 async function ghPush(message) {
-  if (pushInFlight) { console.warn('push already in flight, skip'); return false; }
+  if (pushInFlight) return false;
   pushInFlight = true;
   try {
     const cfg = ghCfg();
@@ -215,11 +203,11 @@ async function ghPush(message) {
     const remote = await ghGetFile(path, cfg);
     if (remote && remote.content) {
       try {
-        const serverData = JSON.parse(b64ToUtf8(remote.content));
-        const rt = new Date(serverData.lastModified || 0).getTime();
+        const sd = JSON.parse(b64ToUtf8(remote.content));
+        const rt = new Date(sd.lastModified || 0).getTime();
         const lt = new Date(state.lastModified || 0).getTime();
         if (rt > lt + 3000) {
-          state = Object.assign(defaultState(), serverData);
+          state = Object.assign(defaultState(), sd);
           localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
           saveUserData(currentUser, state);
           if (typeof renderAll === 'function') renderAll();
@@ -229,8 +217,7 @@ async function ghPush(message) {
       } catch (e) {}
     }
     const content = utf8ToB64(JSON.stringify(state, null, 2));
-    const msg = message || ('sync ' + new Date().toISOString());
-    const res = await ghAtomicPut(path, content, msg, cfg);
+    const res = await ghAtomicPut(path, content, message || ('sync ' + new Date().toISOString()), cfg);
     if (res.ok) {
       ghSha = res.sha;
       cfg.lastSync = new Date().toLocaleString('ru-RU');
@@ -238,9 +225,7 @@ async function ghPush(message) {
       return true;
     }
     return false;
-  } finally {
-    pushInFlight = false;
-  }
+  } finally { pushInFlight = false; }
 }
 async function ghPullAndMerge() {
   if (ghSyncing) return;
@@ -258,11 +243,7 @@ async function ghPullAndMerge() {
       if (typeof renderAll === 'function') renderAll();
       if (typeof toast === 'function') toast('Загружено с GitHub', 'ok');
     }
-  } catch (e) {
-    console.warn('gh pull error', e);
-  } finally {
-    ghSyncing = false;
-  }
+  } catch (e) {} finally { ghSyncing = false; }
 }
 async function ghPushNow(message) {
   try {
@@ -270,18 +251,13 @@ async function ghPushNow(message) {
     if (ok && typeof toast === 'function') toast('Отправлено на GitHub', 'ok');
     ghUpdateStatus();
   } catch (e) {
-    console.warn('gh push error', e);
     if (typeof toast === 'function') toast('Ошибка синхронизации: ' + e.message, 'err');
   }
 }
 function ghSchedulePush() {
   if (ghPushTimer) clearTimeout(ghPushTimer);
-  ghPushTimer = setTimeout(() => {
-    if (ghCfg().token) ghPushNow('auto');
-  }, 5000 + Math.random() * 5000);
+  ghPushTimer = setTimeout(() => { if (ghCfg().token) ghPushNow('auto'); }, 5000 + Math.random() * 5000);
 }
-
-/* ---------- persist hook ---------- */
 function hookPersist() {
   if (typeof persist !== 'function') { setTimeout(hookPersist, 200); return; }
   if (persist.__ghHooked) return;
@@ -296,7 +272,7 @@ function hookPersist() {
 }
 
 /* ============================================================
-   ACCOUNTS RE-RENDER — показ в родной валюте счёта
+   RENDER: ACCOUNTS — валюта счёта
    ============================================================ */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -306,45 +282,31 @@ function renderAccountsNative() {
     return;
   }
   const base = state.settings.baseCurrency;
-  const typeLabelFn = (typeof typeLabel === 'function') ? typeLabel : (t) => t;
-
+  const tL = (typeof typeLabel === 'function') ? typeLabel : (t) => t;
   grid.innerHTML = state.accounts.map(a => {
-    let nativeVal = 0, nativeCur = base;
-    if (a.type === 'cash' || a.type === 'bank') {
-      nativeVal = cashAccountBalance(a);
-      nativeCur = a.currency || base;
-    } else if (a.type === 'crypto') {
-      nativeVal = cryptoAccountValue(a);
-      nativeCur = (a.crypto && a.crypto.currency) || base;
-    } else if (a.type === 'stocks') {
-      nativeVal = stocksAccountValue(a);
-      nativeCur = a.currency || 'USD';
-    }
-    const baseVal = accountValue(a);
-    const showBase = nativeCur !== base;
-
+    let nv = 0, nc = base;
+    if (a.type === 'cash' || a.type === 'bank') { nv = cashAccountBalance(a); nc = a.currency || base; }
+    else if (a.type === 'crypto') { nv = cryptoAccountValue(a); nc = (a.crypto && a.crypto.currency) || base; }
+    else if (a.type === 'stocks') { nv = stocksAccountValue(a); nc = a.currency || 'USD'; }
+    const bv = accountValue(a);
+    const showBase = nc !== base;
     let meta = '';
     if (a.type === 'crypto') {
       const addr = a.crypto && a.crypto.address;
-      meta = `${(a.crypto && a.crypto.network) || ''} · валюта: ${nativeCur} · `
-        + (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : 'адрес не указан')
-        + `<br>${a.crypto && a.crypto.lastUpdated ? 'обновлено ' + new Date(a.crypto.lastUpdated).toLocaleTimeString('ru-RU') : 'ещё не обновлялось'}`;
-    } else if (a.type === 'stocks') {
-      meta = `${(a.holdings || []).length} позиций · валюта: ${nativeCur}`;
-    } else {
-      meta = nativeCur;
-    }
-
+      meta = `${(a.crypto && a.crypto.network) || ''} · валюта: ${nc} · `
+        + (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : 'адрес не указан');
+    } else if (a.type === 'stocks') { meta = `${(a.holdings || []).length} позиций · валюта: ${nc}`; }
+    else { meta = nc; }
     return `<div class="acc-card" style="--c:${a.color}">
       <div class="head">
-        <div><div class="name">${a.name}</div><div class="type">${typeLabelFn(a.type)}</div></div>
+        <div><div class="name">${a.name}</div><div class="type">${tL(a.type)}</div></div>
         <div class="row-actions" style="opacity:1;">
           <button class="icon-btn" onclick="openAccModal(accById('${a.id}'))">✎</button>
           <button class="icon-btn" onclick="deleteAccount('${a.id}')">✕</button>
         </div>
       </div>
-      <div class="bal">${fmt(nativeVal, nativeCur)}</div>
-      ${showBase ? `<div class="meta" style="font-size:11.5px;color:var(--text-dim);margin-top:2px;">≈ ${fmt(baseVal)}</div>` : ''}
+      <div class="bal">${fmt(nv, nc)}</div>
+      ${showBase ? `<div class="meta" style="font-size:11.5px;color:var(--text-dim);margin-top:2px;">≈ ${fmt(bv)}</div>` : ''}
       <div class="meta">${meta}</div>
       <div class="foot">
         ${a.type === 'crypto' ? `<button class="btn ghost small" onclick="refreshCrypto('${a.id}')">↻ Обновить курс</button>` : ''}
@@ -352,6 +314,104 @@ function renderAccountsNative() {
       </div>
     </div>`;
   }).join('');
+}
+
+/* ============================================================
+   RENDER: TRANSACTIONS — мобильные карточки
+   ============================================================ */
+function fmtDateShort(d) {
+  try {
+    const dt = new Date(d);
+    const now = new Date();
+    const sameYear = dt.getFullYear() === now.getFullYear();
+    return dt.toLocaleDateString('ru-RU', {
+      day: 'numeric',
+      month: 'short',
+      ...(sameYear ? {} : { year: '2-digit' })
+    });
+  } catch (e) { return d; }
+}
+
+function renderTransactionsMobile() {
+  const list = document.getElementById('tx-table');
+  if (!list) return;
+  const emptyEl = document.getElementById('tx-empty');
+
+  // превращаем <tbody> в div-контейнер (один раз)
+  let parent = list.parentElement;
+  if (parent && parent.tagName === 'TABLE') {
+    const card = parent.parentElement;
+    if (card && !document.getElementById('tx-mobile-list')) {
+      const wrap = document.createElement('div');
+      wrap.id = 'tx-mobile-list';
+      card.insertBefore(wrap, parent);
+      parent.style.display = 'none';
+    }
+  }
+
+  const wrap = document.getElementById('tx-mobile-list');
+  if (!wrap) return;
+
+  const sorted = [...state.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
+  if (emptyEl) emptyEl.style.display = sorted.length ? 'none' : 'block';
+
+  if (sorted.length === 0) { wrap.innerHTML = ''; return; }
+
+  // группировка по дате
+  const groups = new Map();
+  sorted.forEach(t => {
+    const k = t.date;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(t);
+  });
+
+  wrap.innerHTML = [...groups.entries()].map(([date, items]) => {
+    const daySum = items.reduce((s, t) => s + (t.type === 'income' ? t.amount : (t.type === 'expense' ? -t.amount : 0)), 0);
+    const dayCls = daySum >= 0 ? 'pos' : 'neg';
+    const rows = items.map(t => {
+      const acc = accById(t.accountId);
+      const cat = catById(t.categoryId);
+      const sign = t.type === 'income' ? '+' : (t.type === 'expense' ? '−' : '↔');
+      const cls = t.type === 'income' ? 'pos' : (t.type === 'expense' ? 'neg' : 'tr');
+      let accLabel = acc ? acc.name : '—';
+      if (t.type === 'transfer') {
+        const to = accById(t.toAccountId);
+        accLabel = `${acc ? acc.name : '?'} → ${to ? to.name : '?'}`;
+      }
+      const catColor = cat ? cat.color : '#8b93a1';
+      const catName = cat ? cat.name : 'Без категории';
+      const noteHtml = t.note ? `<div class="m-tx-note">${t.note}</div>` : '';
+      return `<div class="m-tx-row" data-id="${t.id}">
+        <div class="m-tx-cat">
+          <span class="m-tx-dot" style="background:${catColor}"></span>
+          <span class="m-tx-catname">${catName}</span>
+        </div>
+        <div class="m-tx-meta">
+          <span class="m-tx-acc">${accLabel}</span>
+          ${noteHtml}
+        </div>
+        <div class="m-tx-amt ${cls}">${sign}${fmt(t.amount).replace('−', '')}</div>
+        <div class="m-tx-actions">
+          <button class="m-tx-btn" onclick="event.stopPropagation();editTx('${t.id}')">✎</button>
+          <button class="m-tx-btn m-tx-del" onclick="event.stopPropagation();deleteTx('${t.id}')">✕</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="m-tx-day">
+      <div class="m-tx-dayhead">
+        <span>${fmtDateShort(date)}</span>
+        <span class="${dayCls}">${daySum >= 0 ? '+' : '−'}${fmt(Math.abs(daySum)).replace('−', '')}</span>
+      </div>
+      ${rows}
+    </div>`;
+  }).join('');
+
+  wrap.querySelectorAll('.m-tx-row').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.id;
+      if (id && typeof editTx === 'function') editTx(id);
+    });
+  });
 }
 
 /* ============================================================
@@ -376,32 +436,120 @@ function injectMobileCSS() {
   const style = document.createElement('style');
   style.id = 'mobile-mode-css';
   style.textContent = `
+    /* ==== МОБИЛЬНЫЙ РЕЖИМ ==== */
     body.mobile-mode .sidebar { display: none !important; }
-    body.mobile-mode .main { padding: 14px 12px 100px; max-width: 100%; }
+    body.mobile-mode .main { padding: 12px 12px 110px; max-width: 100%; }
     body.mobile-mode .view { display: none !important; }
     body.mobile-mode #view-transactions { display: block !important; }
     body.mobile-mode #view-transactions .page-head {
       display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 12px; padding-right: 110px;
+      margin-bottom: 14px; padding-right: 120px; gap: 8px;
     }
-    body.mobile-mode #view-transactions .page-head h1 { font-size: 18px; }
+    body.mobile-mode #view-transactions .page-head h1 { font-size: 20px; }
     body.mobile-mode #view-transactions .page-head .sub { display: none; }
     body.mobile-mode #view-transactions #add-tx-btn { display: none !important; }
-    body.mobile-mode #view-transactions .card { border-radius: 14px; padding: 10px; }
-    body.mobile-mode #tx-table th:nth-child(2),
-    body.mobile-mode #tx-table th:nth-child(4),
-    body.mobile-mode #tx-table td:nth-child(2),
-    body.mobile-mode #tx-table td:nth-child(4) { display: none; }
-    body.mobile-mode #tx-table td,
-    body.mobile-mode #tx-table th { padding: 8px 6px; font-size: 12.5px; }
-    body.mobile-mode #tx-table .row-actions { opacity: 1; }
+    body.mobile-mode #view-transactions > .card {
+      background: transparent; border: none; padding: 0; box-shadow: none;
+    }
+    body.mobile-mode #tx-table { display: none !important; }
+    body.mobile-mode #tx-empty { padding: 30px 16px; }
 
+    /* ==== СПИСОК ТРАНЗАКЦИЙ КАРТОЧКАМИ ==== */
+    #tx-mobile-list {
+      display: none;
+    }
+    body.mobile-mode #tx-mobile-list {
+      display: block;
+    }
+    .m-tx-day { margin-bottom: 14px; }
+    .m-tx-dayhead {
+      display: flex; justify-content: space-between; align-items: center;
+      font-size: 11.5px; font-weight: 700; letter-spacing: .4px;
+      text-transform: uppercase; color: var(--text-dim, #968F80);
+      padding: 0 6px 8px; margin-bottom: 4px;
+    }
+    .m-tx-dayhead .pos { color: var(--green, #2FBF71); }
+    .m-tx-dayhead .neg { color: var(--red, #F2545B); }
+    .m-tx-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      grid-template-areas: "cat amt" "meta meta";
+      gap: 4px 10px;
+      padding: 12px 14px;
+      background: var(--bg-elev, #fff);
+      border: 1px solid var(--border, #EAE2D3);
+      border-radius: 14px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: background .12s, transform .08s;
+      position: relative;
+    }
+    .m-tx-row:active { background: var(--bg-elev-2, #F2EDE3); transform: scale(.99); }
+    .m-tx-cat {
+      grid-area: cat;
+      display: flex; align-items: center; gap: 8px;
+      font-size: 14px; font-weight: 600; color: var(--text, #2B2620);
+      min-width: 0;
+    }
+    .m-tx-dot {
+      width: 10px; height: 10px; border-radius: 50%; flex: none;
+    }
+    .m-tx-catname {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .m-tx-meta {
+      grid-area: meta;
+      display: flex; flex-direction: column; gap: 2px;
+      font-size: 11.5px; color: var(--text-dim, #968F80);
+      min-width: 0; padding-left: 18px;
+    }
+    .m-tx-acc {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .m-tx-note {
+      font-style: italic;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      opacity: .85;
+    }
+    .m-tx-amt {
+      grid-area: amt;
+      font-family: var(--font-mono, monospace);
+      font-weight: 700;
+      font-size: 15px;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+      align-self: center;
+    }
+    .m-tx-amt.pos { color: var(--green, #2FBF71); }
+    .m-tx-amt.neg { color: var(--red, #F2545B); }
+    .m-tx-amt.tr  { color: var(--text-dim, #968F80); font-weight: 600; }
+    .m-tx-actions {
+      grid-area: amt;
+      display: none;
+    }
+    /* Кнопки действий — показываем только в режиме редактирования (тап) */
+    .m-tx-row.editing .m-tx-actions { display: flex; gap: 6px; }
+    .m-tx-row.editing .m-tx-amt { display: none; }
+    .m-tx-btn {
+      min-width: 44px; min-height: 44px;
+      border: 1px solid var(--border, #EAE2D3);
+      background: var(--bg-elev-2, #F2EDE3);
+      color: var(--text, #2B2620);
+      border-radius: 12px;
+      font-size: 16px;
+      cursor: pointer;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .m-tx-btn:active { background: var(--border, #EAE2D3); }
+    .m-tx-btn.m-tx-del { color: var(--red, #F2545B); border-color: rgba(242,84,91,.35); }
+
+    /* ==== FAB + TOGGLE ==== */
     #mobile-fab {
       position: fixed; right: 18px; bottom: 22px;
-      width: 60px; height: 60px; border-radius: 50%;
+      width: 64px; height: 64px; border-radius: 50%;
       background: #F4A83D; color: #fff; border: none;
-      font-size: 32px; line-height: 1; font-weight: 300;
-      box-shadow: 0 6px 20px rgba(244,168,61,.45);
+      font-size: 34px; line-height: 1; font-weight: 300;
+      box-shadow: 0 6px 22px rgba(244,168,61,.5);
       cursor: pointer; z-index: 9000;
       align-items: center; justify-content: center;
       display: none;
@@ -410,15 +558,89 @@ function injectMobileCSS() {
     #mobile-fab:active { transform: scale(.94); }
 
     #mobile-toggle {
-      position: fixed; right: 18px; top: 14px;
-      padding: 8px 14px; border-radius: 12px;
+      position: fixed; right: 14px; top: 12px;
+      padding: 10px 16px; border-radius: 12px;
       background: var(--bg-elev, #fff); color: var(--text, #2B2620);
       border: 1px solid var(--border, #EAE2D3);
-      font-size: 12.5px; font-weight: 600; cursor: pointer;
-      box-shadow: 0 3px 10px rgba(0,0,0,.06); z-index: 9000;
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      box-shadow: 0 3px 10px rgba(0,0,0,.08); z-index: 9001;
       display: none;
+      min-height: 44px;
     }
     #mobile-toggle.on { display: block; }
+    #mobile-toggle:active { transform: scale(.96); }
+
+    /* ==== МОДАЛКИ — КРУПНЫЕ КНОПКИ НА МОБИЛЬНОМ ==== */
+    @media (max-width: 760px) {
+      .overlay { padding: 10px; align-items: flex-end !important; }
+      .modal {
+        max-width: 100% !important;
+        border-radius: 22px 22px 0 0 !important;
+        padding: 22px 18px 26px !important;
+        max-height: 92vh;
+        overflow: auto;
+      }
+      .modal h2 { font-size: 18px; margin-bottom: 16px; }
+
+      /* Крупные поля ввода */
+      .field label { font-size: 12px; }
+      .field input[type=text],
+      .field input[type=number],
+      .field input[type=date],
+      .field input[type=password],
+      .field select,
+      .field textarea {
+        padding: 14px 14px !important;
+        font-size: 16px !important; /* ≥16px чтобы iOS не зумил */
+        border-radius: 14px !important;
+        min-height: 50px;
+      }
+      .field-row { flex-direction: column; gap: 12px; }
+      .field-row .field { width: 100%; }
+
+      /* Кнопки — full-width, крупные */
+      .modal-actions {
+        flex-direction: column-reverse !important;
+        gap: 10px !important;
+        margin-top: 22px !important;
+        position: sticky;
+        bottom: 0;
+        background: var(--bg-elev, #fff);
+        padding-top: 10px;
+      }
+      .modal-actions .btn {
+        width: 100% !important;
+        padding: 16px 18px !important;
+        font-size: 15.5px !important;
+        min-height: 54px;
+        border-radius: 14px !important;
+      }
+
+      /* Счётчик и действия строки — крупные */
+      .icon-btn {
+        min-width: 44px; min-height: 44px;
+        font-size: 18px;
+      }
+
+      /* Сетка сегментов типа операции */
+      .seg { padding: 4px !important; }
+      .seg button {
+        padding: 12px 6px !important;
+        font-size: 13px !important;
+        min-height: 44px;
+      }
+
+      /* Список категорий в форме */
+      .category-option {
+        padding: 12px 14px !important;
+        font-size: 14px !important;
+        min-height: 46px;
+      }
+
+      /* Общие кнопки .btn */
+      .btn { min-height: 44px; }
+      .btn.small { min-height: 40px; }
+    }
   `;
   document.head.appendChild(style);
 }
@@ -430,9 +652,7 @@ function injectMobileUI() {
     fab.type = 'button';
     fab.textContent = '+';
     fab.setAttribute('aria-label', 'Добавить операцию');
-    fab.onclick = () => {
-      if (typeof openTxModal === 'function') openTxModal(null);
-    };
+    fab.onclick = () => { if (typeof openTxModal === 'function') openTxModal(null); };
     document.body.appendChild(fab);
   }
   if (!document.getElementById('mobile-toggle')) {
@@ -471,7 +691,7 @@ function applyMobileMode() {
 }
 
 /* ============================================================
-   AUTH UI
+   AUTH UI (без изменений)
    ============================================================ */
 function authHtml() {
   return `
@@ -484,66 +704,62 @@ function authHtml() {
         <button id="auth-tab-login" style="flex:1;padding:10px 8px;border:none;background:transparent;font-size:13px;font-weight:600;color:var(--text-dim,#968F80);cursor:pointer;">Вход</button>
         <button id="auth-tab-register" style="flex:1;padding:10px 8px;border:none;background:#F4A83D;color:#fff;font-size:13px;font-weight:600;cursor:pointer;border-radius:11px;margin:2px;">Регистрация</button>
       </div>
-
       <div id="auth-login-form" style="display:none;">
         <div style="margin-bottom:12px;">
           <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
-          <input type="text" id="li-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
+          <input type="text" id="li-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
         </div>
         <div style="margin-bottom:16px;">
           <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
-          <input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
+          <input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
         </div>
-        <button id="li-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:12px 18px;border-radius:13px;font-weight:600;font-size:13.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);">Войти</button>
-        <button id="li-bootstrap" style="width:100%;background:transparent;color:#F4A83D;border:1px solid #F4A83D;padding:10px 18px;border-radius:13px;font-weight:600;font-size:12.5px;cursor:pointer;margin-top:10px;">Войти с другого устройства</button>
+        <button id="li-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);min-height:50px;">Войти</button>
+        <button id="li-bootstrap" style="width:100%;background:transparent;color:#F4A83D;border:1px solid #F4A83D;padding:13px 18px;border-radius:13px;font-weight:600;font-size:13px;cursor:pointer;margin-top:10px;min-height:48px;">Войти с другого устройства</button>
       </div>
-
       <div id="auth-register-form">
         <div style="margin-bottom:12px;">
           <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
-          <input type="text" id="rg-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
+          <input type="text" id="rg-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
         </div>
         <div style="margin-bottom:12px;">
           <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
-          <input type="password" id="rg-pass" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
+          <input type="password" id="rg-pass" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
         </div>
         <div style="margin-bottom:16px;">
           <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Повтор пароля</label>
-          <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:14px;box-sizing:border-box;">
+          <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
         </div>
-        <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:12px 18px;border-radius:13px;font-weight:600;font-size:13.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);">Создать аккаунт</button>
+        <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);min-height:50px;">Создать аккаунт</button>
         <div style="font-size:11.5px;color:var(--text-dim,#968F80);text-align:center;margin-top:14px;line-height:1.5;">
           После регистрации: Настройки → GitHub Sync → настройте токен,<br>тогда аккаунт появится на других устройствах.
         </div>
       </div>
-
       <div id="auth-err" style="color:#F2545B;font-size:12.5px;margin-top:12px;text-align:center;min-height:16px;"></div>
     </div>
-
     <div id="bootstrap-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100000;align-items:center;justify-content:center;padding:20px;">
       <div style="background:var(--bg-elev,#fff);border-radius:22px;padding:26px;width:100%;max-width:380px;box-shadow:0 6px 20px rgba(43,38,32,.15);">
         <h2 style="font-family:'Poppins','Segoe UI',sans-serif;font-size:19px;font-weight:700;margin-bottom:14px;color:var(--text,#2B2620);">Подключение с другого устройства</h2>
-        <p style="font-size:12.5px;color:var(--text-dim,#968F80);line-height:1.5;margin-bottom:14px;">Введите те же настройки GitHub, что и на первом устройстве. Скачаем список аккаунтов.</p>
+        <p style="font-size:12.5px;color:var(--text-dim,#968F80);line-height:1.5;margin-bottom:14px;">Введите те же настройки GitHub, что и на первом устройстве.</p>
         <div style="margin-bottom:10px;">
           <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">GitHub username</label>
-          <input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+          <input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
         </div>
         <div style="margin-bottom:10px;">
           <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Репозиторий</label>
-          <input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+          <input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
         </div>
         <div style="margin-bottom:10px;">
           <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Ветка</label>
-          <input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+          <input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
         </div>
         <div style="margin-bottom:16px;">
           <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Token</label>
-          <input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:10px 12px;border-radius:12px;font-size:13.5px;margin-top:4px;box-sizing:border-box;">
+          <input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
         </div>
         <div id="bs-err" style="color:#F2545B;font-size:12.5px;margin-bottom:10px;min-height:14px;"></div>
-        <div style="display:flex;gap:8px;justify-content:flex-end;">
-          <button id="bs-cancel" style="background:var(--bg-elev-2,#F2EDE3);color:var(--text,#2B2620);border:1px solid var(--border,#EAE2D3);padding:9px 16px;border-radius:11px;font-weight:600;font-size:13px;cursor:pointer;">Отмена</button>
-          <button id="bs-go" style="background:#F4A83D;color:#fff;border:none;padding:9px 16px;border-radius:11px;font-weight:600;font-size:13px;cursor:pointer;">Подключить</button>
+        <div style="display:flex;gap:8px;flex-direction:column-reverse;">
+          <button id="bs-cancel" style="background:var(--bg-elev-2,#F2EDE3);color:var(--text,#2B2620);border:1px solid var(--border,#EAE2D3);padding:14px 16px;border-radius:12px;font-weight:600;font-size:14px;cursor:pointer;width:100%;min-height:50px;">Отмена</button>
+          <button id="bs-go" style="background:#F4A83D;color:#fff;border:none;padding:14px 16px;border-radius:12px;font-weight:600;font-size:14px;cursor:pointer;width:100%;min-height:50px;">Подключить</button>
         </div>
       </div>
     </div>
@@ -557,32 +773,25 @@ function injectAuth() {
   document.body.appendChild(wrap.firstElementChild);
   wireAuth();
 }
-function showAuth() {
-  injectAuth();
-  const el = document.getElementById('auth-screen');
-  if (el) el.style.display = 'flex';
-}
-function hideAuth() {
-  const el = document.getElementById('auth-screen');
-  if (el) el.style.display = 'none';
-}
+function showAuth() { injectAuth(); const el = document.getElementById('auth-screen'); if (el) el.style.display = 'flex'; }
+function hideAuth() { const el = document.getElementById('auth-screen'); if (el) el.style.display = 'none'; }
 
 function setAuthTab(tab) {
-  const loginTab = document.getElementById('auth-tab-login');
-  const regTab = document.getElementById('auth-tab-register');
-  const loginForm = document.getElementById('auth-login-form');
-  const regForm = document.getElementById('auth-register-form');
+  const lt = document.getElementById('auth-tab-login');
+  const rt = document.getElementById('auth-tab-register');
+  const lf = document.getElementById('auth-login-form');
+  const rf = document.getElementById('auth-register-form');
   const err = document.getElementById('auth-err');
   err.textContent = '';
   const on = 'background:#F4A83D;color:#fff;border-radius:11px;margin:2px;';
   const off = 'background:transparent;color:var(--text-dim,#968F80);margin:0;';
   if (tab === 'login') {
-    loginTab.style.cssText += ';' + on; regTab.style.cssText += ';' + off;
-    loginForm.style.display = 'block'; regForm.style.display = 'none';
+    lt.style.cssText += ';' + on; rt.style.cssText += ';' + off;
+    lf.style.display = 'block'; rf.style.display = 'none';
     setTimeout(() => document.getElementById('li-login').focus(), 50);
   } else {
-    regTab.style.cssText += ';' + on; loginTab.style.cssText += ';' + off;
-    regForm.style.display = 'block'; loginForm.style.display = 'none';
+    rt.style.cssText += ';' + on; lt.style.cssText += ';' + off;
+    rf.style.display = 'block'; lf.style.display = 'none';
     setTimeout(() => document.getElementById('rg-login').focus(), 50);
   }
 }
@@ -590,23 +799,18 @@ function setAuthTab(tab) {
 function wireAuth() {
   document.getElementById('auth-tab-login').onclick = () => setAuthTab('login');
   document.getElementById('auth-tab-register').onclick = () => setAuthTab('register');
-
   const doLogin = async () => {
     const login = (document.getElementById('li-login').value || '').trim().toLowerCase();
-    const pass  = document.getElementById('li-pass').value || '';
+    const pass = document.getElementById('li-pass').value || '';
     const err = document.getElementById('auth-err');
     err.textContent = '';
     if (!login || !pass) { err.textContent = 'Заполните логин и пароль'; return; }
     const accs = accounts();
-    if (!accs[login]) {
-      err.textContent = 'Аккаунт не найден. Нажмите «Войти с другого устройства».';
-      return;
-    }
+    if (!accs[login]) { err.textContent = 'Аккаунт не найден. Нажмите «Войти с другого устройства».'; return; }
     const h = await sha256(login + ':' + pass);
     if (h !== accs[login].hash) { err.textContent = 'Неверный пароль'; return; }
     enterAccount(login);
   };
-
   const doRegister = async () => {
     const login = (document.getElementById('rg-login').value || '').trim().toLowerCase();
     const p1 = document.getElementById('rg-pass').value || '';
@@ -624,20 +828,16 @@ function wireAuth() {
     saveAccounts(accs);
     enterAccount(login, true);
   };
-
   document.getElementById('li-submit').onclick = doLogin;
   document.getElementById('rg-submit').onclick = doRegister;
   document.getElementById('li-pass').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
   document.getElementById('rg-pass2').onkeydown = e => { if (e.key === 'Enter') doRegister(); };
-
   document.getElementById('li-bootstrap').onclick = () => {
     document.getElementById('bootstrap-modal').style.display = 'flex';
     document.getElementById('bs-err').textContent = '';
     setTimeout(() => document.getElementById('bs-user').focus(), 50);
   };
-  document.getElementById('bs-cancel').onclick = () => {
-    document.getElementById('bootstrap-modal').style.display = 'none';
-  };
+  document.getElementById('bs-cancel').onclick = () => { document.getElementById('bootstrap-modal').style.display = 'none'; };
   document.getElementById('bs-go').onclick = async () => {
     const user = document.getElementById('bs-user').value.trim();
     const repo = document.getElementById('bs-repo').value.trim() || 'budget-data';
@@ -649,12 +849,8 @@ function wireAuth() {
     if (!user || !repo || !token) { err.textContent = 'Заполните все поля'; return; }
     err.textContent = 'Подключение...';
     const remote = await pullAccountsFile(user, repo, token, branch);
-    if (!remote || Object.keys(remote).length === 0) {
-      err.textContent = 'Не удалось загрузить accounts.json. Проверьте токен/репо.';
-      return;
-    }
-    const local = accounts();
-    const merged = Object.assign({}, remote, local);
+    if (!remote || Object.keys(remote).length === 0) { err.textContent = 'Не удалось загрузить accounts.json.'; return; }
+    const merged = Object.assign({}, remote, accounts());
     localStorage.setItem(ACCOUNTS_KEY, JSON.stringify(merged));
     setPendingGh({ user, repo, token, branch });
     err.style.color = '#2FBF71';
@@ -665,34 +861,25 @@ function wireAuth() {
       document.getElementById('li-pass').focus();
     }, 800);
   };
-
   setAuthTab('login');
 }
 
-function enterAccount(login, isNew) {
+function enterAccount(login) {
   currentUser = login;
   saveSession({ login, createdAt: new Date().toISOString() });
   const pending = pendingGh();
-  if (pending) {
-    ghSaveCfg(pending, login);
-    setPendingGh(null);
-  }
+  if (pending) { ghSaveCfg(pending, login); setPendingGh(null); }
   const udata = loadUserData(login);
-  if (udata) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
-  } else {
-    try {
-      const fresh = defaultState();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(fresh));
-      saveUserData(login, fresh);
-    } catch (e) {}
+  if (udata) localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
+  else {
+    try { const fresh = defaultState(); localStorage.setItem(STORAGE_KEY, JSON.stringify(fresh)); saveUserData(login, fresh); } catch (e) {}
   }
   setLoadedUser(login);
   location.reload();
 }
 
 function logout() {
-  if (!confirm('Выйти из аккаунта? Данные останутся, пароль спросят при входе.')) return;
+  if (!confirm('Выйти из аккаунта?')) return;
   saveSession(null);
   setLoadedUser(null);
   try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
@@ -706,7 +893,6 @@ function injectGithubCard() {
   if (!settings) return;
   const col = settings.querySelector('.grid.two-col');
   if (!col) return;
-
   const cfg = ghCfg();
   const card = document.createElement('div');
   card.className = 'card';
@@ -716,13 +902,12 @@ function injectGithubCard() {
   card.innerHTML = `
     <div class="stat-label" style="margin-bottom:12px;">Синхронизация с GitHub</div>
     <p style="font-size:12.5px;color:var(--text-dim);line-height:1.6;margin-bottom:14px;">
-      Аккаунт: <strong>${currentUser || '—'}</strong>. Данные и список аккаунтов синхронизируются
-      с приватным репозиторием. Токен хранится только в этом браузере.
+      Аккаунт: <strong>${currentUser || '—'}</strong>. Токен хранится только в этом браузере.
     </p>
     <div class="field-row">
       <div class="field"><label>GitHub username</label>
         <input type="text" id="gh-user" value="${cfg.user || ''}" placeholder="ваш-логин"></div>
-      <div class="field"><label>Репозиторий (приватный)</label>
+      <div class="field"><label>Репозиторий</label>
         <input type="text" id="gh-repo" value="${cfg.repo || 'budget-data'}" placeholder="budget-data"></div>
     </div>
     <div class="field-row">
@@ -733,18 +918,16 @@ function injectGithubCard() {
     </div>
     <div class="field"><label>Personal Access Token</label>
       <input type="password" id="gh-token" value="${cfg.token || ''}" placeholder="github_pat_...">
-      <div class="hint">Создать: github.com/settings/tokens?type=beta. Права: Contents → Read and write, только на репозиторий с данными.</div>
     </div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
       <button class="btn small" id="gh-save">Сохранить</button>
       <button class="btn secondary small" id="gh-push">Отправить</button>
       <button class="btn secondary small" id="gh-pull">Загрузить</button>
-      <button class="btn danger small" id="gh-logout" style="margin-left:auto;">Выйти из аккаунта</button>
+      <button class="btn danger small" id="gh-logout" style="margin-left:auto;">Выйти</button>
     </div>
     <div class="hint" id="gh-status" style="margin-top:10px;"></div>
   `;
   col.appendChild(card);
-
   document.getElementById('gh-save').onclick = async () => {
     const c = ghCfg();
     c.user = document.getElementById('gh-user').value.trim();
@@ -759,28 +942,17 @@ function injectGithubCard() {
     await ghPullAndMerge();
     ghUpdateStatus();
   };
-  document.getElementById('gh-push').onclick = async () => {
-    await pushAccountsFile();
-    ghPushNow('manual');
-  };
-  document.getElementById('gh-pull').onclick = async () => {
-    await ghPullAndMerge();
-    if (typeof toast === 'function') toast('Загружено', 'ok');
-    ghUpdateStatus();
-  };
+  document.getElementById('gh-push').onclick = async () => { await pushAccountsFile(); ghPushNow('manual'); };
+  document.getElementById('gh-pull').onclick = async () => { await ghPullAndMerge(); ghUpdateStatus(); };
   document.getElementById('gh-logout').onclick = logout;
   ghUpdateStatus();
 }
-
 function ghUpdateStatus() {
   const el = document.getElementById('gh-status');
   if (!el) return;
   const c = ghCfg();
-  if (!c.token || !c.user || !c.repo) {
-    el.textContent = 'Не настроено. Заполните поля и нажмите Сохранить.';
-  } else {
-    el.textContent = 'Последняя синхронизация: ' + (c.lastSync || '—');
-  }
+  if (!c.token || !c.user || !c.repo) el.textContent = 'Не настроено.';
+  else el.textContent = 'Последняя синхронизация: ' + (c.lastSync || '—');
 }
 
 /* ---------- boot ---------- */
@@ -797,11 +969,8 @@ function boot() {
 
   if (loadedUser() !== s.login) {
     const udata = loadUserData(s.login);
-    if (udata) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
-    } else {
-      try { saveUserData(s.login, state); } catch (e) {}
-    }
+    if (udata) localStorage.setItem(STORAGE_KEY, JSON.stringify(udata));
+    else { try { saveUserData(s.login, state); } catch (e) {} }
     setLoadedUser(s.login);
     location.reload();
     return;
@@ -810,13 +979,11 @@ function boot() {
   hideAuth();
   hookPersist();
 
-  // подменяем рендер счетов на версию с нативной валютой
+  // переопределяем рендеры
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
-  if (typeof renderAll === 'function') {
-    try { renderAll(); } catch (e) {}
-  }
+  try { window.renderTransactions = renderTransactionsMobile; } catch (e) {}
+  if (typeof renderAll === 'function') { try { renderAll(); } catch (e) {} }
 
-  // мобильный режим
   setTimeout(() => { applyMobileMode(); }, 250);
 
   setTimeout(injectGithubCard, 400);
@@ -827,21 +994,20 @@ function boot() {
   const c = ghCfg();
   if (c.token && c.user && c.repo) {
     setTimeout(ghPullAndMerge, 900);
-    setInterval(() => {
-      if (document.visibilityState === 'visible') ghPullAndMerge();
-    }, 120000);
+    setInterval(() => { if (document.visibilityState === 'visible') ghPullAndMerge(); }, 120000);
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') ghPullAndMerge();
     });
   }
 
-  // ресайз — пересчёт мобильного режима
-  let rzTimer = null;
+  let rz = null;
   window.addEventListener('resize', () => {
-    if (rzTimer) clearTimeout(rzTimer);
-    rzTimer = setTimeout(applyMobileMode, 200);
+    if (rz) clearTimeout(rz);
+    rz = setTimeout(applyMobileMode, 200);
   });
   window.addEventListener('orientationchange', applyMobileMode);
+
+  // тап по строке транзакции — редактирование через логику editTx (сработает из onclick в карточке)
 }
 
 if (document.readyState === 'loading') {
