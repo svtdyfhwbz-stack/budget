@@ -1,1 +1,9 @@
-
+{
+  "name": "Family Save",
+  "short_name": "Budget",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#FAF7F2",
+  "theme_color": "#F4A83D",
+  "icons": []
+}
