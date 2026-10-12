@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — v8 (fix tx-table + FAB visibility + FX fallback)
+   sync.js — v9 (fix iPhone tx list, no :has())
    ============================================================= */
 (function () {
 'use strict';
@@ -16,7 +16,6 @@ const MOBILE_MODE_KEY = 'budget_mobile_mode_v1';
 const GOAL_CAT_NAME   = 'Цели';
 const PORTFOLIO_CAT_NAME = 'Портфель';
 
-/* Fallback-курсы (на случай, если API недоступны) */
 const FX_FALLBACK = {
   'USD_EUR': 0.92, 'EUR_USD': 1.087,
   'USD_RUB': 92.0, 'RUB_USD': 0.0109,
@@ -289,20 +288,16 @@ async function convertAmount(amount, fromCur, toCur) {
   if (!fromCur || !toCur || fromCur === toCur) return amount;
   let rate = 1;
   try {
-    if (typeof getFxRate === 'function') {
-      rate = await getFxRate(fromCur, toCur);
-    }
+    if (typeof getFxRate === 'function') rate = await getFxRate(fromCur, toCur);
   } catch (e) { console.warn('convertAmount error', e); }
-  // если rate = 1, а валюты разные — используем fallback-таблицу
   if (!rate || rate === 1) {
     const key = fromCur + '_' + toCur;
     if (FX_FALLBACK[key]) rate = FX_FALLBACK[key];
     else {
-      // пробуем через USD
       const k1 = fromCur + '_USD', k2 = 'USD_' + toCur;
       if (FX_FALLBACK[k1] && FX_FALLBACK[k2]) rate = FX_FALLBACK[k1] * FX_FALLBACK[k2];
     }
-    console.log('[convert] fallback rate', fromCur, '→', toCur, '=', rate);
+    console.log('[convert] fallback', fromCur, '→', toCur, '=', rate);
   }
   return amount * rate;
 }
@@ -351,12 +346,9 @@ function hookDeleteHolding() {
         );
         const removed = before - state.transactions.length;
         if (removed > 0) {
-          persist();
-          renderAll();
+          persist(); renderAll();
           triggerImmediatePush('holding-delete');
-          if (typeof toast === 'function') {
-            toast('Удалено транзакций покупки: ' + removed + '. Деньги вернулись на счёт.', 'ok');
-          }
+          if (typeof toast === 'function') toast('Удалено транзакций покупки: ' + removed, 'ok');
         }
       }, 100);
       return r;
@@ -388,7 +380,7 @@ function setupImmediatePush() {
 }
 
 /* ============================================================
-   RENDER: TRANSACTIONS — объединённый (таблица + карточки)
+   RENDER TRANSACTIONS — таблица + мобильные карточки
    ============================================================ */
 function fmtDateShort(d) {
   try {
@@ -409,7 +401,7 @@ function renderTransactionsCombined() {
   const sorted = [...state.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
   if (emptyEl) emptyEl.style.display = sorted.length ? 'none' : 'block';
 
-  // 1. Обычная таблица (для ПК)
+  /* 1. Обычная таблица */
   if (tbody) {
     if (sorted.length === 0) tbody.innerHTML = '';
     else tbody.innerHTML = sorted.map(t => {
@@ -439,9 +431,9 @@ function renderTransactionsCombined() {
     }).join('');
   }
 
-  // 2. Мобильный список (для телефона)
-  const table = tbody ? tbody.parentElement : null;
-  if (table && table.tagName === 'TABLE') {
+  /* 2. Мобильный список — создаём/находим контейнер */
+  const table = tbody ? tbody.closest('table') : null;
+  if (table) {
     const card = table.parentElement;
     if (card && !document.getElementById('tx-mobile-list')) {
       const wrap = document.createElement('div');
@@ -450,7 +442,10 @@ function renderTransactionsCombined() {
     }
   }
   const wrap = document.getElementById('tx-mobile-list');
-  if (!wrap) return;
+  if (!wrap) {
+    console.warn('[sync] tx-mobile-list not created');
+    return;
+  }
   if (sorted.length === 0) { wrap.innerHTML = ''; return; }
 
   const groups = new Map();
@@ -508,10 +503,28 @@ function renderTransactionsCombined() {
       if (id && typeof editTx === 'function') editTx(id);
     });
   });
+
+  // применяем режим (показать/скрыть table vs mobile list)
+  applyTxVisibility();
+}
+
+/* Прячет/показывает table vs mobile list — работает в любом Safari */
+function applyTxVisibility() {
+  const isMobile = document.body.classList.contains('mobile-mode');
+  const view = document.getElementById('view-transactions');
+  if (!view) return;
+
+  const table = view.querySelector('.card > table');
+  if (table) table.style.display = isMobile ? 'none' : '';
+
+  const wrap = document.getElementById('tx-mobile-list');
+  if (wrap) wrap.style.display = isMobile ? 'block' : 'none';
+
+  console.log('[sync] tx visibility mobile=' + isMobile + ' table=' + !!table + ' wrap=' + !!wrap);
 }
 
 /* ============================================================
-   ACCOUNTS
+   RENDER: ACCOUNTS
    ============================================================ */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -620,7 +633,7 @@ function addGoalFundsModal(goalId) {
   const g = state.goals.find(x => x.id === goalId);
   if (!g) return;
   const accs = accountsForGoal();
-  if (accs.length === 0) { toast('Нет счетов (нужен наличный или банковский)', 'err'); return; }
+  if (accs.length === 0) { toast('Нет счетов', 'err'); return; }
   const base = state.settings.baseCurrency;
   const accOpts = accs.map(a => {
     const cur = a.currency || base;
@@ -637,8 +650,7 @@ function addGoalFundsModal(goalId) {
     <div class="field"><label>Сумма пополнения</label>
       <input type="number" step="0.01" id="gf-amount" value="${remain > 0 ? remain.toFixed(2) : ''}" placeholder="0.00"></div>
     <div class="field"><label>Со счёта</label>
-      <select id="gf-account">${accOpts}</select>
-      <div class="hint">Сумма спишется со счёта и попадёт в накопления цели.</div></div>
+      <select id="gf-account">${accOpts}</select></div>
     <div class="hint">Уже накоплено: <strong>${fmt(current)}</strong> из ${fmt(g.targetAmount)}</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
@@ -772,7 +784,7 @@ function openGoalModalNative(goal) {
 }
 
 /* ============================================================
-   PORTFOLIO / CRYPTO — покупка и продажа со счёта
+   PORTFOLIO / CRYPTO
    ============================================================ */
 function getPortfolioCategory() {
   let cat = state.categories.find(c => c.name === PORTFOLIO_CAT_NAME && c.kind === 'expense');
@@ -797,12 +809,10 @@ function enhanceStockModal() {
 
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
   if (payAccounts.length === 0) return;
-
   const base = state.settings.baseCurrency;
   const opts = payAccounts.map(a => {
     const cur = a.currency || base;
-    const bal = cashAccountBalance(a);
-    return `<option value="${a.id}">${a.name} — ${fmt(bal, cur)}</option>`;
+    return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), cur)}</option>`;
   }).join('');
 
   const field = document.createElement('div');
@@ -828,19 +838,15 @@ function enhanceStockModal() {
       if (document.getElementById('overlay').classList.contains('active')) return;
       const v = __stockModalRead;
       if (!v.payAccId || !v.shares || !v.price || !v.ticker || !v.accId) return;
-
       const buyAcc = accById(v.payAccId);
       const stockAcc = accById(v.accId);
       if (!buyAcc || !stockAcc) return;
-
       const stockCur = stockAcc.currency || 'USD';
       const accCur = buyAcc.currency || state.settings.baseCurrency;
       const totalInStockCur = v.shares * v.price;
       const totalInAccCur = await convertAmount(totalInStockCur, stockCur, accCur);
-
       const candidates = (stockAcc.holdings || []).filter(h => h.ticker === v.ticker);
       const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
-
       const cat = getPortfolioCategory();
       state.transactions.push({
         id: uid(), type: 'expense', date: todayStr(),
@@ -852,9 +858,7 @@ function enhanceStockModal() {
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') {
-        toast(`Списано ${fmt(totalInAccCur, accCur)} (${fmt(totalInStockCur, stockCur)})`, 'ok');
-      }
+      if (typeof toast === 'function') toast(`Списано ${fmt(totalInAccCur, accCur)}`, 'ok');
     }, 150);
   });
 }
@@ -867,15 +871,12 @@ function enhanceCryptoModal() {
   if (!saveBtn) return;
   const h2 = modal.querySelector('h2');
   if (h2 && /Изменить/i.test(h2.textContent)) return;
-
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
   if (payAccounts.length === 0) return;
-
   const base = state.settings.baseCurrency;
   const opts = payAccounts.map(a => {
     const cur = a.currency || base;
-    const bal = cashAccountBalance(a);
-    return `<option value="${a.id}">${a.name} — ${fmt(bal, cur)}</option>`;
+    return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), cur)}</option>`;
   }).join('');
 
   const field = document.createElement('div');
@@ -901,20 +902,16 @@ function enhanceCryptoModal() {
       if (document.getElementById('overlay').classList.contains('active')) return;
       const v = __cryptoModalRead;
       if (!v.payAccId || !v.amount || !v.price || !v.ticker || !v.accId) return;
-
       const buyAcc = accById(v.payAccId);
       const cryptoAcc = accById(v.accId);
       if (!buyAcc || !cryptoAcc) return;
-
       const cryptoCur = (cryptoAcc.crypto && cryptoAcc.crypto.currency) || state.settings.baseCurrency;
       const accCur = buyAcc.currency || state.settings.baseCurrency;
       const totalInCryptoCur = v.amount * v.price;
       const totalInAccCur = await convertAmount(totalInCryptoCur, cryptoCur, accCur);
-
       const list = (cryptoAcc.crypto && cryptoAcc.crypto.holdings) || [];
       const candidates = list.filter(h => h.ticker === v.ticker);
       const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
-
       const cat = getPortfolioCategory();
       state.transactions.push({
         id: uid(), type: 'expense', date: todayStr(),
@@ -926,9 +923,7 @@ function enhanceCryptoModal() {
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') {
-        toast(`Списано ${fmt(totalInAccCur, accCur)} (${fmt(totalInCryptoCur, cryptoCur)})`, 'ok');
-      }
+      if (typeof toast === 'function') toast(`Списано ${fmt(totalInAccCur, accCur)}`, 'ok');
     }, 150);
   });
 }
@@ -938,15 +933,13 @@ function sellStockModal(accId, holdId) {
   if (!acc || acc.type !== 'stocks') return;
   const hold = (acc.holdings || []).find(h => h.id === holdId);
   if (!hold) return;
-
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
   if (payAccounts.length === 0) { toast('Нет счетов', 'err'); return; }
   const base = state.settings.baseCurrency;
   const cur = acc.currency || 'USD';
   const opts = payAccounts.map(a => {
     const acur = a.currency || base;
-    const bal = cashAccountBalance(a);
-    return `<option value="${a.id}">${a.name} — ${fmt(bal, acur)}</option>`;
+    return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), acur)}</option>`;
   }).join('');
   const priceDefault = hold.lastPrice != null ? hold.lastPrice : hold.buyPrice;
 
@@ -976,12 +969,10 @@ function sellStockModal(accId, holdId) {
     if (!dest) return;
     const destCur = dest.currency || base;
     const totalDestCur = await convertAmount(sharesToSell * price, cur, destCur);
-
     const idx = acc.holdings.findIndex(h => h.id === holdId);
     if (idx === -1) return;
     if (sharesToSell >= hold.shares) acc.holdings.splice(idx, 1);
     else acc.holdings[idx].shares -= sharesToSell;
-
     const cat = getPortfolioCategory();
     state.transactions.push({
       id: uid(), type: 'income', date: todayStr(),
@@ -1000,15 +991,13 @@ function sellCryptoModal(accId, holdId) {
   const list = (acc.crypto && acc.crypto.holdings) || [];
   const hold = list.find(h => h.id === holdId);
   if (!hold) return;
-
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
   if (payAccounts.length === 0) { toast('Нет счетов', 'err'); return; }
   const base = state.settings.baseCurrency;
   const cur = (acc.crypto && acc.crypto.currency) || base;
   const opts = payAccounts.map(a => {
     const acur = a.currency || base;
-    const bal = cashAccountBalance(a);
-    return `<option value="${a.id}">${a.name} — ${fmt(bal, acur)}</option>`;
+    return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), acur)}</option>`;
   }).join('');
   const priceDefault = hold.lastPrice != null ? hold.lastPrice : hold.buyPrice;
 
@@ -1038,14 +1027,12 @@ function sellCryptoModal(accId, holdId) {
     if (!dest) return;
     const destCur = dest.currency || base;
     const totalDestCur = await convertAmount(amtToSell * price, cur, destCur);
-
     const idx = list.findIndex(h => h.id === holdId);
     if (idx === -1) return;
     if (amtToSell >= hold.amount) list.splice(idx, 1);
     else list[idx].amount -= amtToSell;
     acc.crypto.holdings = list;
     acc.crypto.lastBalance = list.reduce((s, h) => s + (h.amount || 0), 0);
-
     const cat = getPortfolioCategory();
     state.transactions.push({
       id: uid(), type: 'income', date: todayStr(),
@@ -1079,7 +1066,6 @@ function injectSellButtons() {
     btn.onclick = (e) => { e.stopPropagation(); sellStockModal(accId, holdId); };
     ra.insertBefore(btn, ra.firstChild);
   });
-
   document.querySelectorAll('#crypto-portfolio-list tr').forEach(tr => {
     if (tr.dataset.sellWired) return;
     const ra = tr.querySelector('.row-actions');
@@ -1118,12 +1104,11 @@ function hookPortfolioHooks() {
     setTimeout(hookPortfolioHooks, 200);
     return;
   }
-
   if (typeof window.renderAll === 'function' && !window.renderAll.__portHooked) {
     const orig = window.renderAll;
     window.renderAll = function () {
       const r = orig.apply(this, arguments);
-      setTimeout(injectSellButtons, 80);
+      setTimeout(() => { injectSellButtons(); applyTxVisibility(); }, 80);
       return r;
     };
     window.renderAll.__portHooked = true;
@@ -1150,7 +1135,7 @@ function injectMobileCSS() {
   const style = document.createElement('style');
   style.id = 'mobile-mode-css';
   style.textContent = `
-    /* ==== МОБИЛЬНЫЙ РЕЖИМ ==== */
+    /* МОБИЛЬНЫЙ РЕЖИМ */
     body.mobile-mode .sidebar { display: none !important; }
     body.mobile-mode .main { padding: 12px 12px 110px; max-width: 100%; }
     body.mobile-mode .view { display: none !important; }
@@ -1171,13 +1156,10 @@ function injectMobileCSS() {
     body.mobile-mode #view-transactions > .card {
       background: transparent; border: none; padding: 0; box-shadow: none;
     }
-    body.mobile-mode #tx-table { display: none !important; }
-    body.mobile-mode table:has(#tx-table) { display: none !important; }
     body.mobile-mode #tx-empty { padding: 30px 16px; }
 
-    /* мобильный список виден только в мобильном режиме */
+    /* таблица — управляется inline-стилем в JS, но дадим дефолт */
     #tx-mobile-list { display: none; }
-    body.mobile-mode #tx-mobile-list { display: block; }
 
     .m-tx-day { margin-bottom: 14px; }
     .m-tx-dayhead {
@@ -1215,7 +1197,7 @@ function injectMobileCSS() {
     .m-tx-amt.neg { color: var(--red, #F2545B); }
     .m-tx-amt.tr  { color: var(--text-dim, #968F80); font-weight: 600; }
 
-    /* ==== FAB + GEAR — ТОЛЬКО в мобильном режиме ==== */
+    /* FAB и GEAR — показываются только в мобильном */
     #mobile-fab, #mobile-gear { display: none !important; }
     body.mobile-mode #mobile-fab {
       display: flex !important;
@@ -1246,8 +1228,7 @@ function injectMobileCSS() {
         max-width: 100% !important;
         border-radius: 22px 22px 0 0 !important;
         padding: 22px 18px 26px !important;
-        max-height: 92vh;
-        overflow: auto;
+        max-height: 92vh; overflow: auto;
       }
       .modal h2 { font-size: 18px; margin-bottom: 16px; }
       .field label { font-size: 12px; }
@@ -1264,13 +1245,11 @@ function injectMobileCSS() {
       }
       .field-row { flex-direction: column; gap: 12px; }
       .field-row .field { width: 100%; }
-
       .modal-actions {
         flex-direction: column-reverse !important;
         gap: 10px !important;
         margin-top: 22px !important;
-        position: sticky;
-        bottom: 0;
+        position: sticky; bottom: 0;
         background: var(--bg-elev, #fff);
         padding-top: 10px;
       }
@@ -1298,7 +1277,6 @@ function injectMobileUI() {
     fab.id = 'mobile-fab';
     fab.type = 'button';
     fab.textContent = '+';
-    fab.setAttribute('aria-label', 'Добавить операцию');
     fab.onclick = () => { if (typeof openTxModal === 'function') openTxModal(null); };
     document.body.appendChild(fab);
   }
@@ -1307,14 +1285,10 @@ function injectMobileUI() {
     gear.id = 'mobile-gear';
     gear.type = 'button';
     gear.textContent = '⚙';
-    gear.setAttribute('aria-label', 'Настройки');
     gear.onclick = () => {
       const settingsActive = document.getElementById('view-settings').classList.contains('active');
-      if (settingsActive) {
-        if (typeof showView === 'function') showView('transactions');
-      } else {
-        if (typeof showView === 'function') showView('settings');
-      }
+      if (settingsActive) { if (typeof showView === 'function') showView('transactions'); }
+      else { if (typeof showView === 'function') showView('settings'); }
       setTimeout(updateMobileChrome, 30);
     };
     document.body.appendChild(gear);
@@ -1334,6 +1308,8 @@ function applyMobileMode() {
   const on = isMobileMode();
   document.body.classList.toggle('mobile-mode', on);
   updateMobileChrome();
+  applyTxVisibility();
+  console.log('[sync] applyMobileMode mobile=' + on + ' ua=' + navigator.userAgent.slice(0, 60));
 }
 
 /* ============================================================
@@ -1626,7 +1602,6 @@ function boot() {
   setupImmediatePush();
   hookPortfolioHooks();
 
-  // переопределяем рендеры
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
   try { window.renderTransactions = renderTransactionsCombined; } catch (e) {}
   try { window.renderGoals = renderGoalsNative; } catch (e) {}
@@ -1638,6 +1613,8 @@ function boot() {
   if (typeof renderAll === 'function') { try { renderAll(); } catch (e) {} }
 
   setTimeout(() => { applyMobileMode(); }, 250);
+  setTimeout(() => { applyMobileMode(); }, 800);  // повторно после отрисовки
+  setTimeout(() => { applyMobileMode(); }, 2000); // и ещё раз на всякий
 
   setTimeout(injectGithubCard, 400);
   setInterval(() => {
@@ -1648,7 +1625,7 @@ function boot() {
     const origShow = window.showView;
     window.showView = function (id) {
       origShow.call(this, id);
-      setTimeout(updateMobileChrome, 30);
+      setTimeout(() => { updateMobileChrome(); applyTxVisibility(); }, 30);
     };
     window.showView.__ghHooked = true;
   }
@@ -1683,7 +1660,8 @@ window.ghSync = {
   mobile: {
     state: isMobileMode,
     off: () => setMobileMode(false),
-    on: () => setMobileMode(true)
+    on: () => setMobileMode(true),
+    refresh: applyMobileMode
   },
   goals: {
     add: addGoalFundsModal,
