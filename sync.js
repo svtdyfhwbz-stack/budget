@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — v12 (live crypto search + deposits with interest)
+   sync.js — v13 (full fix: deposits exposed to window)
    ============================================================= */
 (function () {
 'use strict';
@@ -214,12 +214,9 @@ function triggerImmediatePush(reason) {
   ghPushNow(reason || 'immediate');
 }
 
-/* ============================================================
-   FX
-   ============================================================ */
+/* ---------- FX ---------- */
 function loadFxCache() { try { return JSON.parse(localStorage.getItem(FX_CACHE_KEY) || '{}'); } catch { return {}; } }
 function saveFxCache(c) { try { localStorage.setItem(FX_CACHE_KEY, JSON.stringify(c)); } catch (e) {} }
-
 async function fetchFxRate(from, to) {
   if (!from || !to || from === to) return 1;
   const providers = [
@@ -301,12 +298,9 @@ function startFxAutoRefresh() {
   }, FX_REFRESH_MS);
 }
 
-/* ============================================================
-   CRYPTO — ЖИВОЙ ПОИСК ЧЕРЕЗ COINGECKO
-   ============================================================ */
+/* ---------- CRYPTO search ---------- */
 function loadCryptoCache() { try { return JSON.parse(localStorage.getItem(CRYPTO_CACHE_KEY) || '{}'); } catch { return {}; } }
 function saveCryptoCache(c) { try { localStorage.setItem(CRYPTO_CACHE_KEY, JSON.stringify(c)); } catch (e) {} }
-
 async function fetchCryptoTopList() {
   const cached = loadCryptoCache();
   if (cached.ts && Date.now() - cached.ts < CRYPTO_CACHE_MS && Array.isArray(cached.list)) return cached.list;
@@ -314,14 +308,13 @@ async function fetchCryptoTopList() {
     const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&sparkline=false', { cache: 'no-store' });
     const j = await r.json();
     if (Array.isArray(j)) {
-      const list = j.map(c => ({ id: c.id, symbol: (c.symbol || '').toUpperCase(), name: c.name || '', thumb: c.image || '', rank: c.market_cap_rank || 0 }));
+      const list = j.map(c => ({ id: c.id, symbol: (c.symbol || '').toUpperCase(), name: c.name || '', rank: c.market_cap_rank || 0 }));
       saveCryptoCache({ ts: Date.now(), list });
       return list;
     }
-  } catch (e) { console.warn('[crypto] top list fetch error', e); }
+  } catch (e) { console.warn('[crypto] top list error', e); }
   return cached.list || [];
 }
-
 async function searchCryptoLive(q) {
   const query = (q || '').trim().toLowerCase();
   if (!query) return [];
@@ -342,18 +335,13 @@ async function searchCryptoLive(q) {
     coins.slice(0, 25).forEach(c => {
       const sym = (c.symbol || '').toUpperCase();
       if (merged.some(m => m.id === c.id)) return;
-      merged.push({ id: c.id, symbol: sym, name: c.name || '', thumb: c.thumb || '', rank: c.market_cap_rank || 9999 });
+      merged.push({ id: c.id, symbol: sym, name: c.name || '', rank: c.market_cap_rank || 9999 });
     });
     return merged.slice(0, 30);
-  } catch (e) {
-    console.warn('[crypto] search error', e);
-    return local;
-  }
+  } catch (e) { console.warn('[crypto] search error', e); return local; }
 }
 
-/* ============================================================
-   DEPOSIT — РАСЧЁТ
-   ============================================================ */
+/* ---------- DEPOSIT calc ---------- */
 function calcDeposit(acc, asOf) {
   const principal = Number(acc.initialBalance || 0);
   if (acc.type !== 'deposit' || !acc.deposit) {
@@ -367,14 +355,13 @@ function calcDeposit(acc, asOf) {
   const dayMs = 86400000;
   const daysTotal = Math.max(1, Math.round((end - start) / dayMs));
   const daysElapsed = Math.min(daysTotal, Math.max(0, Math.round((now - start) / dayMs)));
-  const yearsElapsed = daysElapsed / 365;
   let interest;
   if (d.capitalization) {
     const months = daysElapsed / 30.4375;
     const monthlyRate = rate / 100 / 12;
     interest = principal * (Math.pow(1 + monthlyRate, months) - 1);
   } else {
-    interest = principal * (rate / 100) * yearsElapsed;
+    interest = principal * (rate / 100) * (daysElapsed / 365);
   }
   return {
     principal, interest, total: principal + interest,
@@ -384,9 +371,7 @@ function calcDeposit(acc, asOf) {
 }
 function depositsList() { return state.accounts.filter(a => a.type === 'deposit'); }
 
-/* ============================================================
-   NAV / VIEW ИНЖЕКТ
-   ============================================================ */
+/* ---------- nav / view injection ---------- */
 function injectDepositsNav() {
   const nav = document.getElementById('nav');
   if (!nav) return;
@@ -394,12 +379,8 @@ function injectDepositsNav() {
   const btn = document.createElement('button');
   btn.className = 'nav-btn';
   btn.dataset.view = 'deposits';
-  btn.innerHTML = `
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M5 21V8l7-5 7 5v13M9 21v-6h6v6M9 12h.01M15 12h.01"/></svg>
-    вклады`;
-  btn.onclick = () => {
-    if (typeof showView === 'function') showView('deposits');
-  };
+  btn.innerHTML = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 21h18M5 21V8l7-5 7 5v13M9 21v-6h6v6M9 12h.01M15 12h.01"/></svg> вклады`;
+  btn.onclick = () => { if (typeof showView === 'function') showView('deposits'); };
   const settingsBtn = nav.querySelector('[data-view="settings"]');
   if (settingsBtn) nav.insertBefore(btn, settingsBtn);
   else nav.appendChild(btn);
@@ -425,9 +406,7 @@ function injectDepositsView() {
   document.getElementById('add-deposit-btn').onclick = () => openDepositModal(null);
 }
 
-/* ============================================================
-   RENDER DEPOSITS
-   ============================================================ */
+/* ---------- render deposits ---------- */
 function renderDeposits() {
   const grid = document.getElementById('deposits-grid');
   const stats = document.getElementById('deposits-stats');
@@ -450,21 +429,20 @@ function renderDeposits() {
     <div class="card"><div class="stat-label">Текущая стоимость</div><div class="stat-value">${fmt(totalCurrent)}</div></div>
   `;
   if (list.length === 0) {
-    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="big">🏦</div>Пока нет вкладов. Нажмите «+ Новый вклад».</div>`;
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="big">🏦</div>Пока нет вкладов</div>`;
     return;
   }
   grid.innerHTML = list.map(a => {
     const c = calcDeposit(a);
     const cur = a.currency || base;
-    const daysLeft = c.daysLeft;
     const pct = c.daysTotal > 0 ? Math.min(100, (c.daysElapsed / c.daysTotal) * 100) : 0;
-    const finish = c.done ? 'срок истёк' : `осталось ${daysLeft} дн.`;
+    const finish = c.done ? 'срок истёк' : 'осталось ' + c.daysLeft + ' дн.';
     return `<div class="acc-card" style="--c:${a.color || '#4fbf8b'}">
       <div class="head">
         <div><div class="name">${a.name}</div><div class="type">Вклад · ${c.rate}% ${a.deposit && a.deposit.capitalization ? '(кап.)' : ''}</div></div>
         <div class="row-actions" style="opacity:1;">
-          <button class="icon-btn" onclick="openDepositModal(accById('${a.id}'))">✎</button>
-          <button class="icon-btn" onclick="closeDeposit('${a.id}')">✕</button>
+          <button class="icon-btn" onclick="window.openDepositModal(window.__accById('${a.id}'))">✎</button>
+          <button class="icon-btn" onclick="window.closeDeposit('${a.id}')">✕</button>
         </div>
       </div>
       <div class="bal">${fmt(c.total, cur)}</div>
@@ -474,16 +452,13 @@ function renderDeposits() {
       </div>
       <div class="bar-track" style="margin-top:10px;"><div class="bar-fill" style="width:${pct}%;background:${a.color || '#4fbf8b'}"></div></div>
       <div class="foot" style="gap:6px;flex-wrap:wrap;">
-        <button class="btn ghost small" onclick="closeDeposit('${a.id}')">Закрыть досрочно</button>
-        <span></span>
+        <button class="btn ghost small" onclick="window.closeDeposit('${a.id}')">Закрыть досрочно</button>
       </div>
     </div>`;
   }).join('');
 }
 
-/* ============================================================
-   DEPOSIT MODAL
-   ============================================================ */
+/* ---------- deposit modal ---------- */
 function openDepositModal(acc) {
   const base = state.settings.baseCurrency;
   const palettes = (typeof PALETTE !== 'undefined') ? PALETTE : ['#d4a54a', '#4fbf8b', '#e36565', '#6fa8d6'];
@@ -520,7 +495,6 @@ function openDepositModal(acc) {
     </div>
   `);
 
-  // авто-срок: при вводе месяцев — считаем end
   const monthsInput = document.getElementById('d-months');
   const endInput = document.getElementById('d-end');
   const startInput = document.getElementById('d-start');
@@ -605,7 +579,7 @@ function closeDeposit(accId) {
   openModal(`
     <h2>Закрыть вклад</h2>
     <div class="field"><label>Вклад</label><input type="text" value="${acc.name}" disabled></div>
-    <div class="hint">Вложено: ${fmt(c.principal, cur)}<br>Проценты: <strong style="color:var(--green)">+${fmt(c.interest, cur)}</strong><br>Итого к возврату: <strong>${fmt(c.total, cur)}</strong></div>
+    <div class="hint">Вложено: ${fmt(c.principal, cur)}<br>Проценты: <strong style="color:var(--green)">+${fmt(c.interest, cur)}</strong><br>Итого: <strong>${fmt(c.total, cur)}</strong></div>
     <div class="field"><label>Зачислить на счёт</label><select id="cd-account">${opts}</select></div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
@@ -619,20 +593,15 @@ function closeDeposit(accId) {
     if (!dest) return;
     const destCur = dest.currency || base;
     const totalInDestCur = await convertAmount(c.total, cur, destCur);
-    const interestInDestCur = await convertAmount(c.interest, cur, destCur);
 
-    // удалить старую транзакцию "Открытие вклада"
     state.transactions = state.transactions.filter(t => !(t.holdingId === accId && t.note && t.note.indexOf('Открытие вклада') === 0));
 
-    // вернуть тело + проценты
     const cat = getPortfolioCategory();
     state.transactions.push({
       id: uid(), type: 'income', date: todayStr(),
       amount: totalInDestCur, accountId: destId, categoryId: cat.id,
-      note: 'Закрытие вклада: ' + acc.name + (interestInDestCur > 0 ? ' (+' + fmt(interestInDestCur, destCur) + ')' : '')
+      note: 'Закрытие вклада: ' + acc.name
     });
-
-    // удалить сам аккаунт-вклад
     state.accounts = state.accounts.filter(a => a.id !== accId);
 
     persist(); closeModal(); renderAll();
@@ -640,9 +609,7 @@ function closeDeposit(accId) {
   };
 }
 
-/* ============================================================
-   ACCOUNTS
-   ============================================================ */
+/* ---------- render accounts ---------- */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
   if (!grid) return;
@@ -661,8 +628,8 @@ function renderAccountsNative() {
         <div class="head">
           <div><div class="name">${a.name}</div><div class="type">Вклад · ${c.rate}%</div></div>
           <div class="row-actions" style="opacity:1;">
-            <button class="icon-btn" onclick="openDepositModal(accById('${a.id}'))">✎</button>
-            <button class="icon-btn" onclick="closeDeposit('${a.id}')">✕</button>
+            <button class="icon-btn" onclick="window.openDepositModal(window.__accById('${a.id}'))">✎</button>
+            <button class="icon-btn" onclick="window.closeDeposit('${a.id}')">✕</button>
           </div>
         </div>
         <div class="bal">${fmt(c.total, cur)}</div>
@@ -703,9 +670,7 @@ function renderAccountsNative() {
   }).join('');
 }
 
-/* ============================================================
-   TRANSACTIONS
-   ============================================================ */
+/* ---------- transactions ---------- */
 function fmtDateShort(d) {
   try {
     const dt = new Date(d);
@@ -720,7 +685,6 @@ function renderTransactionsCombined() {
   const base = state.settings.baseCurrency;
   const sorted = [...state.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
   if (emptyEl) emptyEl.style.display = sorted.length ? 'none' : 'block';
-
   if (tbody) {
     if (sorted.length === 0) tbody.innerHTML = '';
     else tbody.innerHTML = sorted.map(t => {
@@ -730,13 +694,9 @@ function renderTransactionsCombined() {
       const sign = t.type === 'income' ? '+' : (t.type === 'expense' ? '−' : '');
       const cls = t.type === 'income' ? 'pos' : (t.type === 'expense' ? 'neg' : '');
       let accLabel = acc ? acc.name : '—';
-      if (t.type === 'transfer') {
-        const to = accById(t.toAccountId);
-        accLabel = `${acc ? acc.name : '?'} → ${to ? to.name : '?'}`;
-      }
+      if (t.type === 'transfer') { const to = accById(t.toAccountId); accLabel = `${acc ? acc.name : '?'} → ${to ? to.name : '?'}`; }
       return `<tr>
-        <td>${t.date}</td>
-        <td>${accLabel}</td>
+        <td>${t.date}</td><td>${accLabel}</td>
         <td>${cat ? `<span class="tag"><span class="swatch" style="background:${cat.color}"></span>${cat.name}</span>` : '—'}</td>
         <td style="color:var(--text-dim)">${t.note || ''}</td>
         <td class="amount ${cls}">${sign}${fmt(t.amount, cur).replace('−', '')}</td>
@@ -747,14 +707,11 @@ function renderTransactionsCombined() {
       </tr>`;
     }).join('');
   }
-
   const table = tbody ? tbody.closest('table') : null;
   if (table) {
     const card = table.parentElement;
     if (card && !document.getElementById('tx-mobile-list')) {
-      const wrap = document.createElement('div');
-      wrap.id = 'tx-mobile-list';
-      card.insertBefore(wrap, table);
+      const wrap = document.createElement('div'); wrap.id = 'tx-mobile-list'; card.insertBefore(wrap, table);
     }
   }
   const wrap = document.getElementById('tx-mobile-list');
@@ -806,9 +763,7 @@ function applyTxVisibility() {
   if (wrap) wrap.style.display = isMobile ? 'block' : 'none';
 }
 
-/* ============================================================
-   GOALS
-   ============================================================ */
+/* ---------- goals ---------- */
 function computeGoalBalance(g) {
   const initial = Number(g.initialAmount || 0);
   let fromTx = 0;
@@ -962,17 +917,13 @@ function openGoalModalNative(goal) {
   };
 }
 
-/* ============================================================
-   PORTFOLIO / CRYPTO
-   ============================================================ */
+/* ---------- portfolio ---------- */
 function getPortfolioCategory() {
   let cat = state.categories.find(c => c.name === PORTFOLIO_CAT_NAME && c.kind === 'expense');
   if (!cat) { cat = { id: 'portfolio_cat_auto', name: PORTFOLIO_CAT_NAME, color: '#15f211', kind: 'expense' }; state.categories.push(cat); }
   return cat;
 }
-
 const __stockModalRead  = { payAccId: null, accId: null, shares: null, price: null, ticker: null };
-const __cryptoModalRead = { payAccId: null, accId: null, amount: null, price: null, ticker: null };
 
 function enhanceStockModal() {
   if (document.getElementById('sp-payacc-field')) return;
@@ -987,9 +938,8 @@ function enhanceStockModal() {
   const base = state.settings.baseCurrency;
   const opts = payAccounts.map(a => { const cur = a.currency || base; return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), cur)}</option>`; }).join('');
   const field = document.createElement('div');
-  field.className = 'field';
-  field.id = 'sp-payacc-field';
-  field.innerHTML = `<label>Списать со счёта</label><select id="sp-payacc">${opts}</select><div class="hint">Сумма спишется с выбранного счёта.</div>`;
+  field.className = 'field'; field.id = 'sp-payacc-field';
+  field.innerHTML = `<label>Списать со счёта</label><select id="sp-payacc">${opts}</select>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
   saveBtn.addEventListener('click', () => {
@@ -1021,9 +971,6 @@ function enhanceStockModal() {
   });
 }
 
-/* ============================================================
-   КРИПТА — НОВАЯ ФОРМА С ЖИВЫМ ПОИСКОМ
-   ============================================================ */
 function renderCryptoHoldingFormNew(accId, holdId) {
   const acc = accById(accId) || { id: uid(), name: 'Крипто портфель', type: 'crypto', color: '#4fbf8b', crypto: { holdings: [] } };
   const holdings = getCryptoHoldings(acc);
@@ -1031,33 +978,27 @@ function renderCryptoHoldingFormNew(accId, holdId) {
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
   const base = state.settings.baseCurrency;
   const payOpts = payAccounts.map(a => { const cur = a.currency || base; return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), cur)}</option>`; }).join('');
-
   const cryptoAccounts = state.accounts.filter(a => a.type === 'crypto');
   const accOpts = cryptoAccounts.map(a => `<option value="${a.id}" ${a.id === acc.id ? 'selected' : ''}>${a.name}</option>`).join('');
-
   return `
     <h2>${holdId ? 'Изменить позицию' : 'Новая позиция'}</h2>
     <div class="field"><label>Портфель</label><select id="crypto-account">${accOpts}</select></div>
-
     <div class="field" style="position:relative;">
       <label>Поиск монеты</label>
-      <input type="text" id="crypto-search" placeholder="Начните вводить: btc, eth, sol..." autocomplete="off" value="${holding ? holding.ticker : ''}" style="margin-bottom:4px;">
+      <input type="text" id="crypto-search" placeholder="btc, eth, sol..." autocomplete="off" value="${holding ? holding.ticker : ''}" style="margin-bottom:4px;">
       <div id="crypto-search-dropdown" style="position:absolute;left:0;right:0;top:100%;background:var(--bg-elev);border:1px solid var(--border);border-radius:12px;max-height:260px;overflow:auto;z-index:10;display:none;box-shadow:var(--shadow-md);"></div>
       <div class="hint" id="crypto-selected-label">${holding ? `выбрано: <strong>${holding.ticker}</strong> — ${holding.name || ''}` : 'выберите монету из списка'}</div>
     </div>
-
     <div class="field-row">
-      <div class="field"><label>Количество</label><input type="number" step="any" id="crypto-amount" value="${holding ? holding.amount : ''}" placeholder="0.5"></div>
-      <div class="field"><label>Цена покупки</label><input type="text" inputmode="decimal" id="crypto-buy-price" value="${holding ? (holding.buyPriceInput ?? holding.buyPrice ?? '') : ''}" placeholder="0.00"></div>
+      <div class="field"><label>Количество</label><input type="number" step="any" id="crypto-amount" value="${holding ? holding.amount : ''}"></div>
+      <div class="field"><label>Цена покупки</label><input type="text" inputmode="decimal" id="crypto-buy-price" value="${holding ? (holding.buyPriceInput ?? holding.buyPrice ?? '') : ''}"></div>
     </div>
     <div class="field-row">
       <div class="field"><label>Текущая цена (опц.)</label><input type="number" step="any" id="crypto-last-price" value="${holding && holding.lastPrice != null ? holding.lastPrice : ''}"></div>
       <div class="field"><label>Дата покупки</label><input type="date" id="crypto-date" value="${holding ? (holding.buyDate || todayStr()) : todayStr()}"></div>
     </div>
-    <div class="field"><label>Адрес кошелька (для API)</label><input type="text" id="crypto-address" value="${(acc.crypto && acc.crypto.address) || ''}" placeholder="BTC/ETH адрес"></div>
-
-    ${!holdId ? `<div class="field"><label>Списать со счёта</label><select id="crypto-payacc">${payOpts}</select><div class="hint">Сумма спишется с выбранного счёта. Валюты сконвертируются автоматически.</div></div>` : ''}
-
+    <div class="field"><label>Адрес кошелька</label><input type="text" id="crypto-address" value="${(acc.crypto && acc.crypto.address) || ''}"></div>
+    ${!holdId ? `<div class="field"><label>Списать со счёта</label><select id="crypto-payacc">${payOpts}</select></div>` : ''}
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="crypto-save-btn">Сохранить</button>
@@ -1072,10 +1013,7 @@ function openCryptoHoldingModalNew(accId, holdId) {
   }
   const targetAccId = accId || (state.accounts.find(a => a.type === 'crypto') || {}).id || null;
   openModal(renderCryptoHoldingFormNew(targetAccId, holdId));
-
-  // инициализируем кэш топ монет
   fetchCryptoTopList();
-
   const searchInput = document.getElementById('crypto-search');
   const dropdown = document.getElementById('crypto-search-dropdown');
   const selectedLabel = document.getElementById('crypto-selected-label');
@@ -1091,8 +1029,7 @@ function openCryptoHoldingModalNew(accId, holdId) {
           <div style="font-size:11.5px;color:var(--text-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${c.name}</div>
         </div>
         <span style="font-size:11px;color:var(--text-dim);">#${c.rank || '—'}</span>
-      </div>
-    `).join('');
+      </div>`).join('');
     dropdown.style.display = 'block';
     dropdown.querySelectorAll('.crypto-search-row').forEach(row => {
       row.onmouseenter = () => row.style.background = 'var(--bg-elev-2)';
@@ -1105,65 +1042,44 @@ function openCryptoHoldingModalNew(accId, holdId) {
       };
     });
   }
-
   let searchTimer = null;
   searchInput.addEventListener('input', () => {
     const q = searchInput.value.trim();
     if (searchTimer) clearTimeout(searchTimer);
     if (q.length === 0) { dropdown.style.display = 'none'; return; }
-    searchTimer = setTimeout(async () => {
-      const results = await searchCryptoLive(q);
-      renderResults(results);
-    }, 200);
+    searchTimer = setTimeout(async () => { const results = await searchCryptoLive(q); renderResults(results); }, 200);
   });
   searchInput.addEventListener('focus', async () => {
     const q = searchInput.value.trim();
-    if (q.length >= 1) {
-      const results = await searchCryptoLive(q);
-      renderResults(results);
-    } else {
-      const top = await fetchCryptoTopList();
-      renderResults(top.slice(0, 30));
-    }
+    if (q.length >= 1) { const results = await searchCryptoLive(q); renderResults(results); }
+    else { const top = await fetchCryptoTopList(); renderResults(top.slice(0, 30)); }
   });
-  document.addEventListener('click', function clickOutside(e) {
-    if (!searchInput.contains(e.target) && !dropdown.contains(e.target)) {
-      dropdown.style.display = 'none';
-    }
-  }, { once: true });
 
   document.getElementById('crypto-save-btn').onclick = async () => {
     const accountId = document.getElementById('crypto-account').value;
     const acc = accById(accountId);
     if (!acc) { toast('Портфель не найден', 'err'); return; }
-
     const amount = parseFloat(document.getElementById('crypto-amount').value);
     const buyPriceValue = document.getElementById('crypto-buy-price').value.trim();
     const buyPrice = parseFloat(buyPriceValue);
     const lastPrice = parseFloat(document.getElementById('crypto-last-price').value);
     const searchText = searchInput.value.trim().toUpperCase();
-
     const ticker = (selectedCoin && selectedCoin.symbol) || searchText;
     if (!ticker || !(amount > 0)) { toast('Выберите монету и укажите количество', 'err'); return; }
     if (!(buyPrice >= 0)) { toast('Укажите цену покупки', 'err'); return; }
-
     const holdings = getCryptoHoldings(acc);
     const nextHolding = {
-      id: holdId || uid(),
-      ticker,
+      id: holdId || uid(), ticker,
       name: (selectedCoin && selectedCoin.name) || ticker,
       coingeckoId: (selectedCoin && selectedCoin.id) || null,
-      amount,
-      buyPrice: buyPrice || 0,
-      buyPriceInput: buyPriceValue,
+      amount, buyPrice: buyPrice || 0, buyPriceInput: buyPriceValue,
       lastPrice: lastPrice || null,
       buyDate: document.getElementById('crypto-date').value || todayStr(),
       lastUpdated: new Date().toISOString()
     };
     const nextHoldings = holdId ? holdings.map(h => h.id === holdId ? nextHolding : h) : [...holdings, nextHolding];
     acc.crypto = Object.assign({}, acc.crypto, {
-      holdings: nextHoldings,
-      network: ticker,
+      holdings: nextHoldings, network: ticker,
       address: document.getElementById('crypto-address').value.trim(),
       currency: acc.crypto?.currency || acc.currency || state.settings.baseCurrency,
       lastBalance: nextHoldings.reduce((s, h) => s + (h.amount || 0), 0),
@@ -1171,8 +1087,6 @@ function openCryptoHoldingModalNew(accId, holdId) {
       lastPrice: lastPrice || nextHoldings[0]?.lastPrice || null,
       lastUpdated: new Date().toISOString()
     });
-
-    // списание со счёта при новой позиции
     if (!holdId) {
       const payAccId = (document.getElementById('crypto-payacc') || {}).value;
       if (payAccId && buyPrice > 0) {
@@ -1190,16 +1104,12 @@ function openCryptoHoldingModalNew(accId, holdId) {
         }
       }
     }
-
     persist(); closeModal(); renderAll();
     toast('Позиция сохранена', 'ok');
     if (acc.crypto.address) refreshCrypto(acc.id);
   };
 }
 
-/* ============================================================
-   SELL
-   ============================================================ */
 function sellStockModal(accId, holdId) {
   const acc = accById(accId);
   if (!acc || acc.type !== 'stocks') return;
@@ -1214,8 +1124,8 @@ function sellStockModal(accId, holdId) {
   openModal(`
     <h2>Продать ${hold.ticker}</h2>
     <div class="field"><label>В наличии</label><input type="text" value="${hold.shares} шт · по ${fmt(hold.buyPrice, cur)}" disabled></div>
-    <div class="field"><label>Количество к продаже</label><input type="number" step="any" id="ss-shares" value="${hold.shares}" max="${hold.shares}"></div>
-    <div class="field"><label>Цена за единицу (${cur})</label><input type="number" step="any" id="ss-price" value="${priceDefault}"></div>
+    <div class="field"><label>Количество</label><input type="number" step="any" id="ss-shares" value="${hold.shares}" max="${hold.shares}"></div>
+    <div class="field"><label>Цена (${cur})</label><input type="number" step="any" id="ss-price" value="${priceDefault}"></div>
     <div class="field"><label>Зачислить на счёт</label><select id="ss-account">${opts}</select></div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
@@ -1257,8 +1167,8 @@ function sellCryptoModal(accId, holdId) {
   openModal(`
     <h2>Продать ${hold.ticker}</h2>
     <div class="field"><label>В наличии</label><input type="text" value="${hold.amount} ${hold.ticker}" disabled></div>
-    <div class="field"><label>Количество к продаже</label><input type="number" step="any" id="sc-amount" value="${hold.amount}" max="${hold.amount}"></div>
-    <div class="field"><label>Цена за единицу (${cur})</label><input type="number" step="any" id="sc-price" value="${priceDefault}"></div>
+    <div class="field"><label>Количество</label><input type="number" step="any" id="sc-amount" value="${hold.amount}" max="${hold.amount}"></div>
+    <div class="field"><label>Цена (${cur})</label><input type="number" step="any" id="sc-price" value="${priceDefault}"></div>
     <div class="field"><label>Зачислить на счёт</label><select id="sc-account">${opts}</select></div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
@@ -1287,7 +1197,6 @@ function sellCryptoModal(accId, holdId) {
     toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
 }
-
 function injectSellButtons() {
   document.querySelectorAll('#stocks-table tr').forEach(tr => {
     if (tr.dataset.sellWired) return;
@@ -1322,15 +1231,12 @@ function injectSellButtons() {
     ra.insertBefore(btn, ra.firstChild);
   });
 }
-
 function hookPortfolioHooks() {
   if (typeof window.openModal === 'function' && !window.openModal.__portHooked) {
     const orig = window.openModal;
     window.openModal = function (html) {
       const r = orig.apply(this, arguments);
-      setTimeout(() => {
-        if (document.getElementById('sp-save-btn')) enhanceStockModal();
-      }, 50);
+      setTimeout(() => { if (document.getElementById('sp-save-btn')) enhanceStockModal(); }, 50);
       return r;
     };
     window.openModal.__portHooked = true;
@@ -1342,11 +1248,7 @@ function hookPortfolioHooks() {
     const orig = window.renderAll;
     window.renderAll = function () {
       const r = orig.apply(this, arguments);
-      setTimeout(() => {
-        injectSellButtons();
-        applyTxVisibility();
-        try { renderDeposits(); } catch (e) {}
-      }, 80);
+      setTimeout(() => { injectSellButtons(); applyTxVisibility(); try { renderDeposits(); } catch (e) {} }, 80);
       return r;
     };
     window.renderAll.__portHooked = true;
@@ -1392,11 +1294,7 @@ function hookDeleteHolding() {
         const before = state.transactions.length;
         state.transactions = state.transactions.filter(t => !(t.holdingId && holdIds.includes(t.holdingId)));
         const removed = before - state.transactions.length;
-        if (removed > 0) {
-          persist(); renderAll();
-          triggerImmediatePush('holding-delete');
-          if (typeof toast === 'function') toast('Удалено транзакций покупки: ' + removed, 'ok');
-        }
+        if (removed > 0) { persist(); renderAll(); triggerImmediatePush('holding-delete'); if (typeof toast === 'function') toast('Удалено транзакций покупки: ' + removed, 'ok'); }
       }, 100);
       return r;
     };
@@ -1413,22 +1311,20 @@ function setupImmediatePush() {
   document.addEventListener('click', (e) => {
     const t = e.target;
     if (!t || !t.closest) return;
-    const saveTx     = t.closest('#tx-save-btn');
-    const saveAcc    = t.closest('#acc-save-btn');
-    const saveCat    = t.closest('#cat-save-btn');
-    const saveSub    = t.closest('#sub-save-btn');
+    const saveTx = t.closest('#tx-save-btn');
+    const saveAcc = t.closest('#acc-save-btn');
+    const saveCat = t.closest('#cat-save-btn');
+    const saveSub = t.closest('#sub-save-btn');
     const saveBudget = t.closest('#b-save-btn');
-    const saveGoal   = t.closest('#g-save-btn');
+    const saveGoal = t.closest('#g-save-btn');
     const saveDeposit = t.closest('#d-save-btn');
-    const delBtn     = t.closest('[onclick*="deleteTx"]');
+    const delBtn = t.closest('[onclick*="deleteTx"]');
     if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !saveDeposit && !delBtn) return;
     setTimeout(() => triggerImmediatePush(saveDeposit ? 'deposit' : (saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data'))), 200);
   }, false);
 }
 
-/* ============================================================
-   MOBILE MODE
-   ============================================================ */
+/* ---------- mobile ---------- */
 function isMobileDevice() { return /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent); }
 function isMobileMode() { if (!isMobileDevice()) return false; return localStorage.getItem(MOBILE_MODE_KEY) !== 'off'; }
 function setMobileMode(on) { localStorage.setItem(MOBILE_MODE_KEY, on ? 'on' : 'off'); applyMobileMode(); }
@@ -1443,7 +1339,6 @@ function injectMobileCSS() {
     body.mobile-mode #view-transactions.active { display: block !important; }
     body.mobile-mode #view-settings.active { display: block !important; padding: 12px 12px 100px; }
     body.mobile-mode #view-settings .page-head { padding-right: 56px; }
-    body.mobile-mode #view-settings .page-head h1 { font-size: 20px; }
     body.mobile-mode #view-settings .grid.two-col { grid-template-columns: 1fr !important; gap: 12px; }
     body.mobile-mode #view-transactions .page-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px; padding-right: 56px; gap: 8px; }
     body.mobile-mode #view-transactions .page-head h1 { font-size: 20px; }
@@ -1466,7 +1361,7 @@ function injectMobileCSS() {
     .m-tx-amt { grid-area: amt; font-family: var(--font-mono, monospace); font-weight: 700; font-size: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; align-self: center; }
     .m-tx-amt.pos { color: var(--green, #2FBF71); }
     .m-tx-amt.neg { color: var(--red, #F2545B); }
-    .m-tx-amt.tr  { color: var(--text-dim, #968F80); font-weight: 600; }
+    .m-tx-amt.tr { color: var(--text-dim, #968F80); font-weight: 600; }
     #mobile-fab, #mobile-gear { display: none !important; }
     body.mobile-mode #mobile-fab { display: flex !important; position: fixed; right: 18px; bottom: 22px; width: 64px; height: 64px; border-radius: 50%; background: #F4A83D; color: #fff; border: none; font-size: 34px; line-height: 1; font-weight: 300; box-shadow: 0 6px 22px rgba(244,168,61,.5); cursor: pointer; z-index: 9000; align-items: center; justify-content: center; }
     body.mobile-mode #mobile-gear { display: flex !important; position: fixed; right: 14px; top: 12px; width: 44px; height: 44px; border-radius: 50%; background: var(--bg-elev, #fff); color: var(--text-dim, #968F80); border: 1px solid var(--border, #EAE2D3); font-size: 20px; line-height: 1; cursor: pointer; box-shadow: 0 3px 10px rgba(0,0,0,.08); z-index: 9001; align-items: center; justify-content: center; padding: 0; }
@@ -1493,17 +1388,13 @@ function injectMobileCSS() {
 function injectMobileUI() {
   if (!document.getElementById('mobile-fab')) {
     const fab = document.createElement('button');
-    fab.id = 'mobile-fab';
-    fab.type = 'button';
-    fab.textContent = '+';
+    fab.id = 'mobile-fab'; fab.type = 'button'; fab.textContent = '+';
     fab.onclick = () => { if (typeof openTxModal === 'function') openTxModal(null); };
     document.body.appendChild(fab);
   }
   if (!document.getElementById('mobile-gear')) {
     const gear = document.createElement('button');
-    gear.id = 'mobile-gear';
-    gear.type = 'button';
-    gear.textContent = '⚙';
+    gear.id = 'mobile-gear'; gear.type = 'button'; gear.textContent = '⚙';
     gear.onclick = () => {
       const settingsActive = document.getElementById('view-settings').classList.contains('active');
       if (settingsActive) { if (typeof showView === 'function') showView('transactions'); }
@@ -1520,8 +1411,7 @@ function updateMobileChrome() {
   gear.textContent = settingsActive ? '←' : '⚙';
 }
 function applyMobileMode() {
-  injectMobileCSS();
-  injectMobileUI();
+  injectMobileCSS(); injectMobileUI();
   const on = isMobileMode();
   document.body.classList.toggle('mobile-mode', on);
   if (on) {
@@ -1531,13 +1421,10 @@ function applyMobileMode() {
       if (!txActive && typeof showView === 'function') showView('transactions');
     }
   }
-  updateMobileChrome();
-  applyTxVisibility();
+  updateMobileChrome(); applyTxVisibility();
 }
 
-/* ============================================================
-   AUTH UI
-   ============================================================ */
+/* ---------- auth UI ---------- */
 function authHtml() {
   return `
   <div id="auth-screen" style="position:fixed;inset:0;background:var(--bg,#FAF7F2);z-index:99999;display:none;align-items:center;justify-content:center;padding:20px;overflow:auto;">
@@ -1550,20 +1437,15 @@ function authHtml() {
         <button id="auth-tab-register" style="flex:1;padding:10px 8px;border:none;background:#F4A83D;color:#fff;font-size:13px;font-weight:600;cursor:pointer;border-radius:11px;margin:2px;">Регистрация</button>
       </div>
       <div id="auth-login-form" style="display:none;">
-        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
-          <input type="text" id="li-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
-        <div style="margin-bottom:16px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
-          <input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label><input type="text" id="li-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:16px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label><input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
         <button id="li-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;min-height:50px;">Войти</button>
         <button id="li-bootstrap" style="width:100%;background:transparent;color:#F4A83D;border:1px solid #F4A83D;padding:13px 18px;border-radius:13px;font-weight:600;font-size:13px;cursor:pointer;margin-top:10px;min-height:48px;">Войти с другого устройства</button>
       </div>
       <div id="auth-register-form">
-        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
-          <input type="text" id="rg-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
-        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
-          <input type="password" id="rg-pass" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
-        <div style="margin-bottom:16px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Повтор пароля</label>
-          <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label><input type="text" id="rg-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label><input type="password" id="rg-pass" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:16px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Повтор пароля</label><input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
         <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;min-height:50px;">Создать аккаунт</button>
       </div>
       <div id="auth-err" style="color:#F2545B;font-size:12.5px;margin-top:12px;text-align:center;min-height:16px;"></div>
@@ -1571,15 +1453,11 @@ function authHtml() {
     <div id="bootstrap-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:100000;align-items:center;justify-content:center;padding:20px;">
       <div style="background:var(--bg-elev,#fff);border-radius:22px;padding:26px;width:100%;max-width:380px;box-shadow:0 6px 20px rgba(43,38,32,.15);">
         <h2 style="font-family:'Poppins','Segoe UI',sans-serif;font-size:19px;font-weight:700;margin-bottom:14px;color:var(--text,#2B2620);">Подключение с другого устройства</h2>
-        <p style="font-size:12.5px;color:var(--text-dim,#968F80);line-height:1.5;margin-bottom:14px;">Введите те же настройки GitHub, что и на первом устройстве.</p>
-        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">GitHub username</label>
-          <input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
-        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Репозиторий</label>
-          <input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
-        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Ветка</label>
-          <input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
-        <div style="margin-bottom:16px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Token</label>
-          <input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <p style="font-size:12.5px;color:var(--text-dim,#968F80);line-height:1.5;margin-bottom:14px;">Введите те же настройки GitHub.</p>
+        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">GitHub username</label><input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Репозиторий</label><input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Ветка</label><input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:16px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Token</label><input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
         <div id="bs-err" style="color:#F2545B;font-size:12.5px;margin-bottom:10px;min-height:14px;"></div>
         <div style="display:flex;gap:8px;flex-direction:column-reverse;">
           <button id="bs-cancel" style="background:var(--bg-elev-2,#F2EDE3);color:var(--text,#2B2620);border:1px solid var(--border,#EAE2D3);padding:14px 16px;border-radius:12px;font-weight:600;font-size:14px;cursor:pointer;width:100%;min-height:50px;">Отмена</button>
@@ -1607,15 +1485,8 @@ function setAuthTab(tab) {
   err.textContent = '';
   const on = 'background:#F4A83D;color:#fff;border-radius:11px;margin:2px;';
   const off = 'background:transparent;color:var(--text-dim,#968F80);margin:0;';
-  if (tab === 'login') {
-    lt.style.cssText += ';' + on; rt.style.cssText += ';' + off;
-    lf.style.display = 'block'; rf.style.display = 'none';
-    setTimeout(() => document.getElementById('li-login').focus(), 50);
-  } else {
-    rt.style.cssText += ';' + on; lt.style.cssText += ';' + off;
-    rf.style.display = 'block'; lf.style.display = 'none';
-    setTimeout(() => document.getElementById('rg-login').focus(), 50);
-  }
+  if (tab === 'login') { lt.style.cssText += ';' + on; rt.style.cssText += ';' + off; lf.style.display = 'block'; rf.style.display = 'none'; setTimeout(() => document.getElementById('li-login').focus(), 50); }
+  else { rt.style.cssText += ';' + on; lt.style.cssText += ';' + off; rf.style.display = 'block'; lf.style.display = 'none'; setTimeout(() => document.getElementById('rg-login').focus(), 50); }
 }
 function wireAuth() {
   document.getElementById('auth-tab-login').onclick = () => setAuthTab('login');
@@ -1697,13 +1568,12 @@ function enterAccount(login) {
 }
 function logout() {
   if (!confirm('Выйти из аккаунта?')) return;
-  saveSession(null);
-  setLoadedUser(null);
+  saveSession(null); setLoadedUser(null);
   try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
   location.reload();
 }
 
-/* ---------- GitHub settings card ---------- */
+/* ---------- GitHub card ---------- */
 function injectGithubCard() {
   if (document.getElementById('gh-sync-card')) return;
   const settings = document.getElementById('view-settings');
@@ -1712,13 +1582,11 @@ function injectGithubCard() {
   if (!col) return;
   const cfg = ghCfg();
   const card = document.createElement('div');
-  card.className = 'card';
-  card.id = 'gh-sync-card';
-  card.style.gridColumn = '1 / -1';
-  card.style.marginTop = '16px';
+  card.className = 'card'; card.id = 'gh-sync-card';
+  card.style.gridColumn = '1 / -1'; card.style.marginTop = '16px';
   card.innerHTML = `
     <div class="stat-label" style="margin-bottom:12px;">Синхронизация с GitHub</div>
-    <p style="font-size:12.5px;color:var(--text-dim);line-height:1.6;margin-bottom:14px;">Аккаунт: <strong>${currentUser || '—'}</strong>. Токен хранится только в этом браузере.</p>
+    <p style="font-size:12.5px;color:var(--text-dim);line-height:1.6;margin-bottom:14px;">Аккаунт: <strong>${currentUser || '—'}</strong>. Токен хранится в этом браузере.</p>
     <div class="field-row">
       <div class="field"><label>GitHub username</label><input type="text" id="gh-user" value="${cfg.user || ''}"></div>
       <div class="field"><label>Репозиторий</label><input type="text" id="gh-repo" value="${cfg.repo || 'budget-data'}"></div>
@@ -1734,8 +1602,7 @@ function injectGithubCard() {
       <button class="btn secondary small" id="gh-pull">Загрузить</button>
       <button class="btn danger small" id="gh-logout" style="margin-left:auto;">Выйти</button>
     </div>
-    <div class="hint" id="gh-status" style="margin-top:10px;"></div>
-  `;
+    <div class="hint" id="gh-status" style="margin-top:10px;"></div>`;
   col.appendChild(card);
   document.getElementById('gh-save').onclick = async () => {
     const c = ghCfg();
@@ -1746,9 +1613,7 @@ function injectGithubCard() {
     c.token = document.getElementById('gh-token').value.trim();
     ghSaveCfg(c); ghSha = null;
     toast('Настройки сохранены', 'ok');
-    await pushAccountsFile();
-    await ghPullAndMerge();
-    ghUpdateStatus();
+    await pushAccountsFile(); await ghPullAndMerge(); ghUpdateStatus();
   };
   document.getElementById('gh-push').onclick = async () => { await pushAccountsFile(); ghPushNow('manual'); };
   document.getElementById('gh-pull').onclick = async () => { await ghPullAndMerge(); ghUpdateStatus(); };
@@ -1792,11 +1657,7 @@ function boot() {
   hookPortfolioHooks();
   hookFxGlobals();
 
-  // Ждём появления DOM от index.html и инжектим свои элементы
-  setTimeout(() => {
-    injectDepositsNav();
-    injectDepositsView();
-  }, 150);
+  setTimeout(() => { injectDepositsNav(); injectDepositsView(); }, 150);
 
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
   try { window.renderTransactions = renderTransactionsCombined; } catch (e) {}
@@ -1805,11 +1666,9 @@ function boot() {
   try { window.withdrawGoalFunds = withdrawGoalFundsModal; } catch (e) {}
   try { window.openGoalModal = openGoalModalNative; } catch (e) {}
   try { window.editGoal = function(id){ openGoalModalNative(state.goals.find(g => g.id === id)); }; } catch (e) {}
-
-  // Подменяем форму крипты на свою (с живым поиском)
   try { window.openCryptoHoldingModal = openCryptoHoldingModalNew; } catch (e) {}
 
-  // Встраиваем наш рендер вкладок в renderAll (в дополнение к portfolio hook)
+  // обёртка renderAll — рисует вклады
   try {
     const base = window.renderAll;
     if (base && !base.__depHook) {
@@ -1837,16 +1696,13 @@ function boot() {
   setTimeout(tryMobile, 1500);
 
   setTimeout(injectGithubCard, 400);
-  setInterval(() => {
-    if (!document.getElementById('gh-sync-card')) injectGithubCard();
-  }, 1500);
+  setInterval(() => { if (!document.getElementById('gh-sync-card')) injectGithubCard(); }, 1500);
 
+  // обёртка showView — блок в мобильном
   if (typeof window.showView === 'function' && !window.showView.__ghHooked) {
     const origShow = window.showView;
     window.showView = function (id) {
-      // В мобильном режиме разрешаем только transactions и settings
       if (isMobileMode() && id !== 'settings' && id !== 'transactions') id = 'transactions';
-      // Если целевой view не существует — игнорируем (например, deposits удалён)
       const targetView = document.getElementById('view-' + id);
       if (!targetView) return;
       origShow.call(this, id);
@@ -1857,8 +1713,7 @@ function boot() {
       setTimeout(() => {
         updateMobileChrome();
         applyTxVisibility();
-        // Если перешли во вклады — отрисовать
-        if (id === 'deposits') renderDeposits();
+        if (id === 'deposits') try { renderDeposits(); } catch (e) {}
       }, 30);
     };
     window.showView.__ghHooked = true;
@@ -1887,6 +1742,28 @@ if (document.readyState === 'loading') {
   boot();
 }
 
+/* ============================================================
+   ГЛАВНОЕ: экспорт функций в window — чтобы inline onclick нашёл
+   ============================================================ */
+
+// утилиты (нужны для inline onclick в карточках вкладов)
+window.__accById = accById;
+window.__uid = uid;
+window.__todayStr = todayStr;
+
+// вклады
+window.openDepositModal = openDepositModal;
+window.closeDeposit = closeDeposit;
+window.calcDeposit = calcDeposit;
+window.renderDeposits = renderDeposits;
+window.depositsList = depositsList;
+
+// крипта
+window.openCryptoHoldingModalNew = openCryptoHoldingModalNew;
+window.searchCryptoLive = searchCryptoLive;
+window.fetchCryptoTopList = fetchCryptoTopList;
+
+// API
 window.ghSync = {
   pull: ghPullAndMerge,
   push: () => ghPushNow('manual'),
@@ -1895,48 +1772,17 @@ window.ghSync = {
   cfg: ghCfg,
   logout: logout,
   whoami: () => currentUser,
-  mobile: {
-    state: isMobileMode,
-    off: () => setMobileMode(false),
-    on: () => setMobileMode(true),
-    refresh: applyMobileMode
-  },
+  mobile: { state: isMobileMode, off: () => setMobileMode(false), on: () => setMobileMode(true), refresh: applyMobileMode },
   fx: {
     refresh: () => refreshAllFxRates(true).then(r => { renderAll(); return r; }),
     convert: convertAmount,
     cache: loadFxCache,
     clearCache: () => { localStorage.removeItem(FX_CACHE_KEY); }
   },
-  crypto: {
-    search: searchCryptoLive,
-    top: fetchCryptoTopList,
-    openModal: openCryptoHoldingModalNew
-  },
-  deposits: {
-    open: openDepositModal,
-    close: closeDeposit,
-    calc: calcDeposit,
-    list: depositsList
-  },
-  goals: {
-    add: addGoalFundsModal,
-    withdraw: withdrawGoalFundsModal,
-    balance: computeGoalBalance
-  },
-  portfolio: {
-    sellStock: sellStockModal,
-    sellCrypto: sellCryptoModal
-  }
+  crypto: { search: searchCryptoLive, top: fetchCryptoTopList, openModal: openCryptoHoldingModalNew },
+  deposits: { open: openDepositModal, close: closeDeposit, calc: calcDeposit, list: depositsList },
+  goals: { add: addGoalFundsModal, withdraw: withdrawGoalFundsModal, balance: computeGoalBalance },
+  portfolio: { sellStock: sellStockModal, sellCrypto: sellCryptoModal }
 };
-
-/* ─── ЭКСПОРТ В WINDOW ─── */
-window.openDepositModal = openDepositModal;
-window.closeDeposit = closeDeposit;
-window.calcDeposit = calcDeposit;
-window.renderDeposits = renderDeposits;
-window.depositsList = depositsList;
-window.openCryptoHoldingModalNew = openCryptoHoldingModalNew;
-window.searchCryptoLive = searchCryptoLive;
-window.fetchCryptoTopList = fetchCryptoTopList;
 
 })();
