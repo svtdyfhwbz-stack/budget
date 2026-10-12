@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — v14 (balance correction)
+   sync.js — v14.1 (fix deposit close double balance)
    ============================================================= */
 (function () {
 'use strict';
@@ -594,8 +594,10 @@ function closeDeposit(accId) {
     const destCur = dest.currency || base;
     const totalInDestCur = await convertAmount(c.total, cur, destCur);
 
-    state.transactions = state.transactions.filter(t => !(t.holdingId === accId && t.note && t.note.indexOf('Открытие вклада') === 0));
-
+    // ФИКС v14.1: транзакцию "Открытие вклада" НЕ удаляем.
+    // Она уже удержала principal с источника при создании вклада.
+    // При закрытии добавляем income = principal + interest на приёмник.
+    // Итог: источник −principal + (principal + interest) = +interest (если тот же счёт)
     const cat = getPortfolioCategory();
     state.transactions.push({
       id: uid(), type: 'income', date: todayStr(),
@@ -1401,9 +1403,10 @@ function setupImmediatePush() {
     const saveGoal = t.closest('#g-save-btn');
     const saveDeposit = t.closest('#d-save-btn');
     const saveCorrection = t.closest('#bc-save-btn');
+    const closeDep = t.closest('#cd-save-btn');
     const delBtn = t.closest('[onclick*="deleteTx"]');
-    if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !saveDeposit && !saveCorrection && !delBtn) return;
-    setTimeout(() => triggerImmediatePush(saveCorrection ? 'correction' : (saveDeposit ? 'deposit' : (saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data')))), 200);
+    if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !saveDeposit && !saveCorrection && !closeDep && !delBtn) return;
+    setTimeout(() => triggerImmediatePush(closeDep ? 'deposit-close' : (saveCorrection ? 'correction' : (saveDeposit ? 'deposit' : (saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data'))))), 200);
   }, false);
 }
 
