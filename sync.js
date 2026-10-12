@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — v9 (fix iPhone tx list, no :has())
+   sync.js — v11 (live FX rates + mobile initial view fix)
    ============================================================= */
 (function () {
 'use strict';
@@ -15,6 +15,9 @@ const ACCOUNTS_FILE   = 'accounts.json';
 const MOBILE_MODE_KEY = 'budget_mobile_mode_v1';
 const GOAL_CAT_NAME   = 'Цели';
 const PORTFOLIO_CAT_NAME = 'Портфель';
+const FX_CACHE_KEY    = 'budget_fx_rates_v1';
+const FX_REFRESH_MS   = 15 * 60 * 1000;   // обновление каждые 15 мин
+const FX_STALE_MS     = 60 * 60 * 1000;   // старше часа — обновить в фоне
 
 const FX_FALLBACK = {
   'USD_EUR': 0.92, 'EUR_USD': 1.087,
@@ -38,6 +41,7 @@ let ghAccountsTimer = null;
 let ghSyncing = false;
 let booted = false;
 let pushInFlight = false;
+let fxTimer = null;
 
 /* ---------- storage ---------- */
 function accounts() {
@@ -76,8 +80,7 @@ function loadUserData(u) {
   catch { return null; }
 }
 function saveUserData(u, data) {
-  try { localStorage.setItem(dataKey(u), JSON.stringify(data)); }
-  catch (e) {}
+  try { localStorage.setItem(dataKey(u), JSON.stringify(data)); } catch (e) {}
 }
 function ghCfg(u) {
   u = u || currentUser;
@@ -283,23 +286,165 @@ function triggerImmediatePush(reason) {
   ghPushNow(reason || 'immediate');
 }
 
-/* ---------- conversion ---------- */
+/* ============================================================
+   FX — ЖИВЫЕ КУРСЫ
+   ============================================================ */
+function loadFxCache() {
+  try { return JSON.parse(localStorage.getItem(FX_CACHE_KEY) || '{}'); }
+  catch { return {}; }
+}
+function saveFxCache(c) {
+  try { localStorage.setItem(FX_CACHE_KEY, JSON.stringify(c)); } catch (e) {}
+}
+
+/* 4 независимых API — берём первый, который ответил */
+async function fetchFxRate(from, to) {
+  if (!from || !to || from === to) return 1;
+  const providers = [
+    async () => {
+      const r = await fetch(`https://open.er-api.com/v6/latest/${from}`, { cache: 'no-store' });
+      const j = await r.json();
+      return j && j.rates && j.rates[to];
+    },
+    async () => {
+      const r = await fetch(`https://api.frankfurter.app/latest?from=${from}&to=${to}`, { cache: 'no-store' });
+      const j = await r.json();
+      return j && j.rates && j.rates[to];
+    },
+    async () => {
+      const r = await fetch(`https://api.exchangerate-api.com/v4/latest/${from}`, { cache: 'no-store' });
+      const j = await r.json();
+      return j && j.rates && j.rates[to];
+    },
+    async () => {
+      const f = from.toLowerCase(), t = to.toLowerCase();
+      const r = await fetch(`https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/${f}.json`, { cache: 'no-store' });
+      const j = await r.json();
+      return j && j[f] && j[f][t];
+    }
+  ];
+  for (const p of providers) {
+    try {
+      const rate = await p();
+      if (rate && rate > 0) {
+        console.log('[fx] live', from, '→', to, '=', rate);
+        return rate;
+      }
+    } catch (e) { /* next */ }
+  }
+  console.warn('[fx] all providers failed for', from, '→', to);
+  return null;
+}
+
+/* Забираем курсы для всех валют пользователя */
+async function refreshAllFxRates(showToast) {
+  const cache = loadFxCache();
+  const base = (state && state.settings && state.settings.baseCurrency) || 'RUB';
+  const currencies = new Set([base]);
+  (state.accounts || []).forEach(a => {
+    if (a.currency) currencies.add(a.currency);
+    if (a.type === 'crypto' && a.crypto && a.crypto.currency) currencies.add(a.crypto.currency);
+  });
+  const others = [...currencies].filter(c => c !== base);
+  let updated = 0, total = 0;
+
+  for (const cur of others) {
+    total++;
+    const rate = await fetchFxRate(cur, base);
+    if (rate) {
+      cache[cur + '_' + base] = { rate, ts: Date.now() };
+      cache[base + '_' + cur] = { rate: 1 / rate, ts: Date.now() };
+      updated++;
+    } else {
+      const k = cur + '_' + base;
+      if (!cache[k] || !cache[k].rate) {
+        if (FX_FALLBACK[k]) cache[k] = { rate: FX_FALLBACK[k], ts: 0, fallback: true };
+      }
+    }
+  }
+  saveFxCache(cache);
+  console.log('[fx] refreshed', updated, 'of', total, 'rates');
+
+  if (showToast && typeof toast === 'function') {
+    if (updated > 0) toast('Курсы обновлены (' + updated + ')', 'ok');
+    else if (total > 0) toast('Курсы не удалось получить — используется кэш', 'err');
+  }
+  return { updated, total };
+}
+
+/* Синхронный cached — используется в renderAll (index.html ждёт число) */
+function cachedFxRateLive(from, to) {
+  if (!from || !to || from === to) return 1;
+  const cache = loadFxCache();
+  const entry = cache[from + '_' + to];
+  if (entry && entry.rate) return entry.rate;
+  if (FX_FALLBACK[from + '_' + to]) return FX_FALLBACK[from + '_' + to];
+  const k1 = from + '_USD', k2 = 'USD_' + to;
+  if (FX_FALLBACK[k1] && FX_FALLBACK[k2]) return FX_FALLBACK[k1] * FX_FALLBACK[k2];
+  return 1;
+}
+
+/* Асинхронный — для конвертаций */
+async function getFxRateLive(from, to) {
+  if (!from || !to || from === to) return 1;
+  const cache = loadFxCache();
+  const key = from + '_' + to;
+  const entry = cache[key];
+  const now = Date.now();
+
+  if (entry && entry.rate) {
+    if (now - entry.ts > FX_STALE_MS) {
+      // фоновое обновление, но возвращаем старый
+      fetchFxRate(from, to).then(rate => {
+        if (rate) {
+          const c = loadFxCache();
+          c[key] = { rate, ts: Date.now() };
+          c[to + '_' + from] = { rate: 1 / rate, ts: Date.now() };
+          saveFxCache(c);
+        }
+      }).catch(() => {});
+    }
+    return entry.rate;
+  }
+
+  // нет в кэше — ждём ответа
+  const rate = await fetchFxRate(from, to);
+  if (rate) {
+    cache[key] = { rate, ts: Date.now() };
+    cache[to + '_' + from] = { rate: 1 / rate, ts: Date.now() };
+    saveFxCache(cache);
+    return rate;
+  }
+  return cachedFxRateLive(from, to);
+}
+
 async function convertAmount(amount, fromCur, toCur) {
   if (!fromCur || !toCur || fromCur === toCur) return amount;
-  let rate = 1;
   try {
-    if (typeof getFxRate === 'function') rate = await getFxRate(fromCur, toCur);
-  } catch (e) { console.warn('convertAmount error', e); }
-  if (!rate || rate === 1) {
-    const key = fromCur + '_' + toCur;
-    if (FX_FALLBACK[key]) rate = FX_FALLBACK[key];
-    else {
-      const k1 = fromCur + '_USD', k2 = 'USD_' + toCur;
-      if (FX_FALLBACK[k1] && FX_FALLBACK[k2]) rate = FX_FALLBACK[k1] * FX_FALLBACK[k2];
-    }
-    console.log('[convert] fallback', fromCur, '→', toCur, '=', rate);
+    const rate = await getFxRateLive(fromCur, toCur);
+    return amount * rate;
+  } catch (e) {
+    return amount * cachedFxRateLive(fromCur, toCur);
   }
-  return amount * rate;
+}
+
+/* Переопределяем функции из index.html, чтобы рендер использовал живой кэш */
+function hookFxGlobals() {
+  try { window.cachedFxRate = cachedFxRateLive; } catch (e) {}
+  try { window.fxRate = getFxRateLive; } catch (e) {}
+  try { window.getFxRate = getFxRateLive; } catch (e) {}
+}
+
+/* Таймер автообновления */
+function startFxAutoRefresh() {
+  if (fxTimer) clearInterval(fxTimer);
+  fxTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      refreshAllFxRates(false).then(() => {
+        if (typeof renderAll === 'function') renderAll();
+      });
+    }
+  }, FX_REFRESH_MS);
 }
 
 /* ---------- hooks ---------- */
@@ -317,7 +462,6 @@ function hookPersist() {
   };
   window.persist.__ghHooked = true;
 }
-
 function hookDeleteTx() {
   if (typeof window.deleteTx !== 'function') { setTimeout(hookDeleteTx, 300); return; }
   if (window.deleteTx.__ghHooked) return;
@@ -329,7 +473,6 @@ function hookDeleteTx() {
   };
   window.deleteTx.__ghHooked = true;
 }
-
 function hookDeleteHolding() {
   const wrapDelete = (fnName) => {
     if (typeof window[fnName] !== 'function') return false;
@@ -360,7 +503,6 @@ function hookDeleteHolding() {
   const okB = wrapDelete('deleteCryptoHolding');
   if (!okA || !okB) setTimeout(hookDeleteHolding, 400);
 }
-
 function setupImmediatePush() {
   if (setupImmediatePush.__wired) return;
   setupImmediatePush.__wired = true;
@@ -380,7 +522,7 @@ function setupImmediatePush() {
 }
 
 /* ============================================================
-   RENDER TRANSACTIONS — таблица + мобильные карточки
+   RENDER TRANSACTIONS
    ============================================================ */
 function fmtDateShort(d) {
   try {
@@ -393,7 +535,6 @@ function fmtDateShort(d) {
     });
   } catch (e) { return d; }
 }
-
 function renderTransactionsCombined() {
   const tbody = document.getElementById('tx-table');
   const emptyEl = document.getElementById('tx-empty');
@@ -401,7 +542,6 @@ function renderTransactionsCombined() {
   const sorted = [...state.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
   if (emptyEl) emptyEl.style.display = sorted.length ? 'none' : 'block';
 
-  /* 1. Обычная таблица */
   if (tbody) {
     if (sorted.length === 0) tbody.innerHTML = '';
     else tbody.innerHTML = sorted.map(t => {
@@ -431,7 +571,6 @@ function renderTransactionsCombined() {
     }).join('');
   }
 
-  /* 2. Мобильный список — создаём/находим контейнер */
   const table = tbody ? tbody.closest('table') : null;
   if (table) {
     const card = table.parentElement;
@@ -442,10 +581,7 @@ function renderTransactionsCombined() {
     }
   }
   const wrap = document.getElementById('tx-mobile-list');
-  if (!wrap) {
-    console.warn('[sync] tx-mobile-list not created');
-    return;
-  }
+  if (!wrap) return;
   if (sorted.length === 0) { wrap.innerHTML = ''; return; }
 
   const groups = new Map();
@@ -454,7 +590,6 @@ function renderTransactionsCombined() {
     if (!groups.has(k)) groups.set(k, []);
     groups.get(k).push(t);
   });
-
   wrap.innerHTML = [...groups.entries()].map(([date, items]) => {
     const daySum = items.reduce((s, t) => s + (t.type === 'income' ? t.amount : (t.type === 'expense' ? -t.amount : 0)), 0);
     const dayCls = daySum >= 0 ? 'pos' : 'neg';
@@ -473,14 +608,8 @@ function renderTransactionsCombined() {
       const catName = cat ? cat.name : 'Без категории';
       const noteHtml = t.note ? `<div class="m-tx-note">${t.note}</div>` : '';
       return `<div class="m-tx-row" data-id="${t.id}">
-        <div class="m-tx-cat">
-          <span class="m-tx-dot" style="background:${catColor}"></span>
-          <span class="m-tx-catname">${catName}</span>
-        </div>
-        <div class="m-tx-meta">
-          <span class="m-tx-acc">${accLabel}</span>
-          ${noteHtml}
-        </div>
+        <div class="m-tx-cat"><span class="m-tx-dot" style="background:${catColor}"></span><span class="m-tx-catname">${catName}</span></div>
+        <div class="m-tx-meta"><span class="m-tx-acc">${accLabel}</span>${noteHtml}</div>
         <div class="m-tx-amt ${cls}">${sign}${fmt(t.amount, cur).replace('−', '')}</div>
         <div class="m-tx-actions">
           <button class="m-tx-btn" onclick="event.stopPropagation();editTx('${t.id}')">✎</button>
@@ -489,10 +618,7 @@ function renderTransactionsCombined() {
       </div>`;
     }).join('');
     return `<div class="m-tx-day">
-      <div class="m-tx-dayhead">
-        <span>${fmtDateShort(date)}</span>
-        <span class="${dayCls}">${daySum >= 0 ? '+' : '−'}${fmt(Math.abs(daySum), base).replace('−', '')}</span>
-      </div>
+      <div class="m-tx-dayhead"><span>${fmtDateShort(date)}</span><span class="${dayCls}">${daySum >= 0 ? '+' : '−'}${fmt(Math.abs(daySum), base).replace('−', '')}</span></div>
       ${rows}
     </div>`;
   }).join('');
@@ -503,28 +629,21 @@ function renderTransactionsCombined() {
       if (id && typeof editTx === 'function') editTx(id);
     });
   });
-
-  // применяем режим (показать/скрыть table vs mobile list)
   applyTxVisibility();
 }
 
-/* Прячет/показывает table vs mobile list — работает в любом Safari */
 function applyTxVisibility() {
   const isMobile = document.body.classList.contains('mobile-mode');
   const view = document.getElementById('view-transactions');
   if (!view) return;
-
   const table = view.querySelector('.card > table');
   if (table) table.style.display = isMobile ? 'none' : '';
-
   const wrap = document.getElementById('tx-mobile-list');
   if (wrap) wrap.style.display = isMobile ? 'block' : 'none';
-
-  console.log('[sync] tx visibility mobile=' + isMobile + ' table=' + !!table + ' wrap=' + !!wrap);
 }
 
 /* ============================================================
-   RENDER: ACCOUNTS
+   RENDER ACCOUNTS
    ============================================================ */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -545,8 +664,7 @@ function renderAccountsNative() {
     let meta = '';
     if (a.type === 'crypto') {
       const addr = a.crypto && a.crypto.address;
-      meta = `${(a.crypto && a.crypto.network) || ''} · валюта: ${nc} · `
-        + (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : 'адрес не указан');
+      meta = `${(a.crypto && a.crypto.network) || ''} · валюта: ${nc} · ` + (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : 'адрес не указан');
     } else if (a.type === 'stocks') { meta = `${(a.holdings || []).length} позиций · валюта: ${nc}`; }
     else { meta = nc; }
     return `<div class="acc-card" style="--c:${a.color}">
@@ -628,7 +746,6 @@ function renderGoalsNative() {
     </div>`;
   }).join('');
 }
-
 function addGoalFundsModal(goalId) {
   const g = state.goals.find(x => x.id === goalId);
   if (!g) return;
@@ -649,17 +766,13 @@ function addGoalFundsModal(goalId) {
     <div class="field"><label>Цель</label><input type="text" value="${g.name}" disabled></div>
     <div class="field"><label>Сумма пополнения</label>
       <input type="number" step="0.01" id="gf-amount" value="${remain > 0 ? remain.toFixed(2) : ''}" placeholder="0.00"></div>
-    <div class="field"><label>Со счёта</label>
-      <select id="gf-account">${accOpts}</select></div>
+    <div class="field"><label>Со счёта</label><select id="gf-account">${accOpts}</select></div>
     <div class="hint">Уже накоплено: <strong>${fmt(current)}</strong> из ${fmt(g.targetAmount)}</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="gf-save-btn">Внести</button>
     </div>`);
-  setTimeout(() => {
-    const inp = document.getElementById('gf-amount');
-    if (inp) { inp.focus(); inp.select(); }
-  }, 100);
+  setTimeout(() => { const inp = document.getElementById('gf-amount'); if (inp) { inp.focus(); inp.select(); } }, 100);
 
   document.getElementById('gf-save-btn').onclick = () => {
     const amt = parseFloat(document.getElementById('gf-amount').value);
@@ -669,9 +782,7 @@ function addGoalFundsModal(goalId) {
     if (!acc) { toast('Счёт не найден', 'err'); return; }
     const cur = acc.currency || base;
     const bal = cashAccountBalance(acc);
-    if (bal < amt) {
-      if (!confirm(`На счёте «${acc.name}» только ${fmt(bal, cur)}. Продолжить?`)) return;
-    }
+    if (bal < amt) { if (!confirm(`На счёте «${acc.name}» только ${fmt(bal, cur)}. Продолжить?`)) return; }
     const cat = getGoalCategory();
     state.transactions.push({
       id: uid(), type: 'expense', date: todayStr(), amount: amt,
@@ -682,7 +793,6 @@ function addGoalFundsModal(goalId) {
     toast('Цель пополнена на ' + fmt(amt, cur), 'ok');
   };
 }
-
 function withdrawGoalFundsModal(goalId) {
   const g = state.goals.find(x => x.id === goalId);
   if (!g) return;
@@ -708,10 +818,7 @@ function withdrawGoalFundsModal(goalId) {
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="gw-save-btn">Вывести</button>
     </div>`);
-  setTimeout(() => {
-    const inp = document.getElementById('gw-amount');
-    if (inp) { inp.focus(); inp.select(); }
-  }, 100);
+  setTimeout(() => { const inp = document.getElementById('gw-amount'); if (inp) { inp.focus(); inp.select(); } }, 100);
 
   document.getElementById('gw-save-btn').onclick = () => {
     const amt = parseFloat(document.getElementById('gw-amount').value);
@@ -729,7 +836,6 @@ function withdrawGoalFundsModal(goalId) {
     toast('Возвращено на ' + acc.name + ': ' + fmt(amt, acc.currency || base), 'ok');
   };
 }
-
 function goalFormNative(goal) {
   const g = goal || { name: '', targetAmount: '', initialAmount: 0, deadline: '',
     color: (typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a', accountId: '' };
@@ -740,7 +846,6 @@ function goalFormNative(goal) {
     .concat(accs.map(a => `<option value="${a.id}" ${g.accountId === a.id ? 'selected' : ''}>${a.name}</option>`))
     .join('');
   const initialVal = (goal && (goal.initialAmount != null ? goal.initialAmount : goal.currentAmount)) || 0;
-
   return `
     <h2>${goal ? 'Изменить цель' : 'Новая цель'}</h2>
     <div class="field"><label>Название</label><input type="text" id="g-name" value="${g.name}"></div>
@@ -756,7 +861,6 @@ function goalFormNative(goal) {
       <button class="btn" id="g-save-btn">Сохранить</button>
     </div>`;
 }
-
 function openGoalModalNative(goal) {
   openModal(goalFormNative(goal));
   let color = goal ? goal.color : ((typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a');
@@ -794,7 +898,6 @@ function getPortfolioCategory() {
   }
   return cat;
 }
-
 const __stockModalRead  = { payAccId: null, accId: null, shares: null, price: null, ticker: null };
 const __cryptoModalRead = { payAccId: null, accId: null, amount: null, price: null, ticker: null };
 
@@ -806,7 +909,6 @@ function enhanceStockModal() {
   if (!saveBtn) return;
   const h2 = modal.querySelector('h2');
   if (h2 && /Изменить/i.test(h2.textContent)) return;
-
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
   if (payAccounts.length === 0) return;
   const base = state.settings.baseCurrency;
@@ -814,17 +916,13 @@ function enhanceStockModal() {
     const cur = a.currency || base;
     return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), cur)}</option>`;
   }).join('');
-
   const field = document.createElement('div');
   field.className = 'field';
   field.id = 'sp-payacc-field';
-  field.innerHTML = `
-    <label>Списать со счёта</label>
-    <select id="sp-payacc">${opts}</select>
-    <div class="hint">Сумма спишется с выбранного счёта. Если валюта отличается — конвертируется.</div>`;
+  field.innerHTML = `<label>Списать со счёта</label><select id="sp-payacc">${opts}</select>
+    <div class="hint">Сумма спишется с выбранного счёта. Если валюта отличается — конвертируется по живому курсу.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
-
   saveBtn.addEventListener('click', () => {
     __stockModalRead.payAccId = (document.getElementById('sp-payacc') || {}).value || null;
     __stockModalRead.accId    = (document.getElementById('sp-account') || {}).value || null;
@@ -832,7 +930,6 @@ function enhanceStockModal() {
     __stockModalRead.price    = parseFloat((document.getElementById('sp-price')  || {}).value) || 0;
     __stockModalRead.ticker   = ((document.getElementById('sp-ticker') || {}).value || '').trim().toUpperCase();
   }, true);
-
   saveBtn.addEventListener('click', () => {
     setTimeout(async () => {
       if (document.getElementById('overlay').classList.contains('active')) return;
@@ -843,26 +940,21 @@ function enhanceStockModal() {
       if (!buyAcc || !stockAcc) return;
       const stockCur = stockAcc.currency || 'USD';
       const accCur = buyAcc.currency || state.settings.baseCurrency;
-      const totalInStockCur = v.shares * v.price;
-      const totalInAccCur = await convertAmount(totalInStockCur, stockCur, accCur);
+      const totalInAccCur = await convertAmount(v.shares * v.price, stockCur, accCur);
       const candidates = (stockAcc.holdings || []).filter(h => h.ticker === v.ticker);
       const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
       const cat = getPortfolioCategory();
       state.transactions.push({
         id: uid(), type: 'expense', date: todayStr(),
-        amount: totalInAccCur,
-        accountId: v.payAccId, categoryId: cat.id,
-        note: 'Покупка ' + v.ticker,
-        holdingId: holdingId,
-        holdingAccId: v.accId
+        amount: totalInAccCur, accountId: v.payAccId, categoryId: cat.id,
+        note: 'Покупка ' + v.ticker, holdingId, holdingAccId: v.accId
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') toast(`Списано ${fmt(totalInAccCur, accCur)}`, 'ok');
+      if (typeof toast === 'function') toast('Списано ' + fmt(totalInAccCur, accCur), 'ok');
     }, 150);
   });
 }
-
 function enhanceCryptoModal() {
   if (document.getElementById('crypto-payacc-field')) return;
   const modal = document.getElementById('modal');
@@ -878,17 +970,13 @@ function enhanceCryptoModal() {
     const cur = a.currency || base;
     return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), cur)}</option>`;
   }).join('');
-
   const field = document.createElement('div');
   field.className = 'field';
   field.id = 'crypto-payacc-field';
-  field.innerHTML = `
-    <label>Списать со счёта</label>
-    <select id="crypto-payacc">${opts}</select>
-    <div class="hint">Сумма спишется с выбранного счёта. Если валюта отличается — конвертируется.</div>`;
+  field.innerHTML = `<label>Списать со счёта</label><select id="crypto-payacc">${opts}</select>
+    <div class="hint">Сумма спишется с выбранного счёта. Если валюта отличается — конвертируется по живому курсу.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
-
   saveBtn.addEventListener('click', () => {
     __cryptoModalRead.payAccId = (document.getElementById('crypto-payacc') || {}).value || null;
     __cryptoModalRead.accId    = (document.getElementById('crypto-account') || {}).value || null;
@@ -896,7 +984,6 @@ function enhanceCryptoModal() {
     __cryptoModalRead.price    = parseFloat((document.getElementById('crypto-buy-price') || {}).value) || 0;
     __cryptoModalRead.ticker   = ((document.getElementById('crypto-search') || {}).value || '').trim().toUpperCase();
   }, true);
-
   saveBtn.addEventListener('click', () => {
     setTimeout(async () => {
       if (document.getElementById('overlay').classList.contains('active')) return;
@@ -907,27 +994,22 @@ function enhanceCryptoModal() {
       if (!buyAcc || !cryptoAcc) return;
       const cryptoCur = (cryptoAcc.crypto && cryptoAcc.crypto.currency) || state.settings.baseCurrency;
       const accCur = buyAcc.currency || state.settings.baseCurrency;
-      const totalInCryptoCur = v.amount * v.price;
-      const totalInAccCur = await convertAmount(totalInCryptoCur, cryptoCur, accCur);
+      const totalInAccCur = await convertAmount(v.amount * v.price, cryptoCur, accCur);
       const list = (cryptoAcc.crypto && cryptoAcc.crypto.holdings) || [];
       const candidates = list.filter(h => h.ticker === v.ticker);
       const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
       const cat = getPortfolioCategory();
       state.transactions.push({
         id: uid(), type: 'expense', date: todayStr(),
-        amount: totalInAccCur,
-        accountId: v.payAccId, categoryId: cat.id,
-        note: 'Покупка ' + v.ticker,
-        holdingId: holdingId,
-        holdingAccId: v.accId
+        amount: totalInAccCur, accountId: v.payAccId, categoryId: cat.id,
+        note: 'Покупка ' + v.ticker, holdingId, holdingAccId: v.accId
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') toast(`Списано ${fmt(totalInAccCur, accCur)}`, 'ok');
+      if (typeof toast === 'function') toast('Списано ' + fmt(totalInAccCur, accCur), 'ok');
     }, 150);
   });
 }
-
 function sellStockModal(accId, holdId) {
   const acc = accById(accId);
   if (!acc || acc.type !== 'stocks') return;
@@ -942,22 +1024,16 @@ function sellStockModal(accId, holdId) {
     return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), acur)}</option>`;
   }).join('');
   const priceDefault = hold.lastPrice != null ? hold.lastPrice : hold.buyPrice;
-
   openModal(`
     <h2>Продать ${hold.ticker}</h2>
-    <div class="field"><label>В наличии</label>
-      <input type="text" value="${hold.shares} шт · по ${fmt(hold.buyPrice, cur)}" disabled></div>
-    <div class="field"><label>Количество к продаже</label>
-      <input type="number" step="any" id="ss-shares" value="${hold.shares}" max="${hold.shares}"></div>
-    <div class="field"><label>Цена за единицу (${cur})</label>
-      <input type="number" step="any" id="ss-price" value="${priceDefault}"></div>
-    <div class="field"><label>Зачислить на счёт</label>
-      <select id="ss-account">${opts}</select></div>
+    <div class="field"><label>В наличии</label><input type="text" value="${hold.shares} шт · по ${fmt(hold.buyPrice, cur)}" disabled></div>
+    <div class="field"><label>Количество к продаже</label><input type="number" step="any" id="ss-shares" value="${hold.shares}" max="${hold.shares}"></div>
+    <div class="field"><label>Цена за единицу (${cur})</label><input type="number" step="any" id="ss-price" value="${priceDefault}"></div>
+    <div class="field"><label>Зачислить на счёт</label><select id="ss-account">${opts}</select></div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="ss-save-btn">Продать</button>
     </div>`);
-
   document.getElementById('ss-save-btn').onclick = async () => {
     const sharesToSell = parseFloat(document.getElementById('ss-shares').value);
     const price = parseFloat(document.getElementById('ss-price').value);
@@ -975,16 +1051,13 @@ function sellStockModal(accId, holdId) {
     else acc.holdings[idx].shares -= sharesToSell;
     const cat = getPortfolioCategory();
     state.transactions.push({
-      id: uid(), type: 'income', date: todayStr(),
-      amount: totalDestCur,
-      accountId: destAccId, categoryId: cat.id,
-      note: 'Продажа ' + hold.ticker
+      id: uid(), type: 'income', date: todayStr(), amount: totalDestCur,
+      accountId: destAccId, categoryId: cat.id, note: 'Продажа ' + hold.ticker
     });
     persist(); closeModal(); renderAll();
     toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
 }
-
 function sellCryptoModal(accId, holdId) {
   const acc = accById(accId);
   if (!acc || acc.type !== 'crypto') return;
@@ -1000,22 +1073,16 @@ function sellCryptoModal(accId, holdId) {
     return `<option value="${a.id}">${a.name} — ${fmt(cashAccountBalance(a), acur)}</option>`;
   }).join('');
   const priceDefault = hold.lastPrice != null ? hold.lastPrice : hold.buyPrice;
-
   openModal(`
     <h2>Продать ${hold.ticker}</h2>
-    <div class="field"><label>В наличии</label>
-      <input type="text" value="${hold.amount} ${hold.ticker}" disabled></div>
-    <div class="field"><label>Количество к продаже</label>
-      <input type="number" step="any" id="sc-amount" value="${hold.amount}" max="${hold.amount}"></div>
-    <div class="field"><label>Цена за единицу (${cur})</label>
-      <input type="number" step="any" id="sc-price" value="${priceDefault}"></div>
-    <div class="field"><label>Зачислить на счёт</label>
-      <select id="sc-account">${opts}</select></div>
+    <div class="field"><label>В наличии</label><input type="text" value="${hold.amount} ${hold.ticker}" disabled></div>
+    <div class="field"><label>Количество к продаже</label><input type="number" step="any" id="sc-amount" value="${hold.amount}" max="${hold.amount}"></div>
+    <div class="field"><label>Цена за единицу (${cur})</label><input type="number" step="any" id="sc-price" value="${priceDefault}"></div>
+    <div class="field"><label>Зачислить на счёт</label><select id="sc-account">${opts}</select></div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="sc-save-btn">Продать</button>
     </div>`);
-
   document.getElementById('sc-save-btn').onclick = async () => {
     const amtToSell = parseFloat(document.getElementById('sc-amount').value);
     const price = parseFloat(document.getElementById('sc-price').value);
@@ -1035,16 +1102,13 @@ function sellCryptoModal(accId, holdId) {
     acc.crypto.lastBalance = list.reduce((s, h) => s + (h.amount || 0), 0);
     const cat = getPortfolioCategory();
     state.transactions.push({
-      id: uid(), type: 'income', date: todayStr(),
-      amount: totalDestCur,
-      accountId: destAccId, categoryId: cat.id,
-      note: 'Продажа ' + hold.ticker
+      id: uid(), type: 'income', date: todayStr(), amount: totalDestCur,
+      accountId: destAccId, categoryId: cat.id, note: 'Продажа ' + hold.ticker
     });
     persist(); closeModal(); renderAll();
     toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
 }
-
 function injectSellButtons() {
   document.querySelectorAll('#stocks-table tr').forEach(tr => {
     if (tr.dataset.sellWired) return;
@@ -1054,8 +1118,7 @@ function injectSellButtons() {
     if (!delBtn) return;
     const m = delBtn.getAttribute('onclick').match(/deleteHolding\('([^']+)','([^']+)'\)/);
     if (!m) return;
-    const accId = m[1];
-    const holdId = m[2].split(',')[0];
+    const accId = m[1], holdId = m[2].split(',')[0];
     tr.dataset.sellWired = '1';
     const btn = document.createElement('button');
     btn.className = 'icon-btn';
@@ -1074,8 +1137,7 @@ function injectSellButtons() {
     if (!delBtn) return;
     const m = delBtn.getAttribute('onclick').match(/deleteCryptoHolding\('([^']+)','([^']+)'\)/);
     if (!m) return;
-    const accId = m[1].split(',')[0];
-    const holdId = m[2].split(',')[0];
+    const accId = m[1].split(',')[0], holdId = m[2].split(',')[0];
     tr.dataset.sellWired = '1';
     const btn = document.createElement('button');
     btn.className = 'icon-btn';
@@ -1087,7 +1149,6 @@ function injectSellButtons() {
     ra.insertBefore(btn, ra.firstChild);
   });
 }
-
 function hookPortfolioHooks() {
   if (typeof window.openModal === 'function' && !window.openModal.__portHooked) {
     const orig = window.openModal;
@@ -1129,20 +1190,16 @@ function setMobileMode(on) {
   localStorage.setItem(MOBILE_MODE_KEY, on ? 'on' : 'off');
   applyMobileMode();
 }
-
 function injectMobileCSS() {
   if (document.getElementById('mobile-mode-css')) return;
   const style = document.createElement('style');
   style.id = 'mobile-mode-css';
   style.textContent = `
-    /* МОБИЛЬНЫЙ РЕЖИМ */
     body.mobile-mode .sidebar { display: none !important; }
     body.mobile-mode .main { padding: 12px 12px 110px; max-width: 100%; }
     body.mobile-mode .view { display: none !important; }
     body.mobile-mode #view-transactions.active { display: block !important; }
-    body.mobile-mode #view-settings.active {
-      display: block !important; padding: 12px 12px 100px;
-    }
+    body.mobile-mode #view-settings.active { display: block !important; padding: 12px 12px 100px; }
     body.mobile-mode #view-settings .page-head { padding-right: 56px; }
     body.mobile-mode #view-settings .page-head h1 { font-size: 20px; }
     body.mobile-mode #view-settings .grid.two-col { grid-template-columns: 1fr !important; gap: 12px; }
@@ -1157,10 +1214,7 @@ function injectMobileCSS() {
       background: transparent; border: none; padding: 0; box-shadow: none;
     }
     body.mobile-mode #tx-empty { padding: 30px 16px; }
-
-    /* таблица — управляется inline-стилем в JS, но дадим дефолт */
     #tx-mobile-list { display: none; }
-
     .m-tx-day { margin-bottom: 14px; }
     .m-tx-dayhead {
       display: flex; justify-content: space-between; align-items: center;
@@ -1171,16 +1225,11 @@ function injectMobileCSS() {
     .m-tx-dayhead .pos { color: var(--green, #2FBF71); }
     .m-tx-dayhead .neg { color: var(--red, #F2545B); }
     .m-tx-row {
-      display: grid;
-      grid-template-columns: 1fr auto;
+      display: grid; grid-template-columns: 1fr auto;
       grid-template-areas: "cat amt" "meta meta";
-      gap: 4px 10px;
-      padding: 12px 14px;
-      background: var(--bg-elev, #fff);
-      border: 1px solid var(--border, #EAE2D3);
-      border-radius: 14px;
-      margin-bottom: 6px;
-      cursor: pointer;
+      gap: 4px 10px; padding: 12px 14px;
+      background: var(--bg-elev, #fff); border: 1px solid var(--border, #EAE2D3);
+      border-radius: 14px; margin-bottom: 6px; cursor: pointer;
     }
     .m-tx-row:active { background: var(--bg-elev-2, #F2EDE3); }
     .m-tx-cat { grid-area: cat; display: flex; align-items: center; gap: 8px;
@@ -1196,22 +1245,17 @@ function injectMobileCSS() {
     .m-tx-amt.pos { color: var(--green, #2FBF71); }
     .m-tx-amt.neg { color: var(--red, #F2545B); }
     .m-tx-amt.tr  { color: var(--text-dim, #968F80); font-weight: 600; }
-
-    /* FAB и GEAR — показываются только в мобильном */
     #mobile-fab, #mobile-gear { display: none !important; }
     body.mobile-mode #mobile-fab {
-      display: flex !important;
-      position: fixed; right: 18px; bottom: 22px;
+      display: flex !important; position: fixed; right: 18px; bottom: 22px;
       width: 64px; height: 64px; border-radius: 50%;
       background: #F4A83D; color: #fff; border: none;
       font-size: 34px; line-height: 1; font-weight: 300;
       box-shadow: 0 6px 22px rgba(244,168,61,.5);
-      cursor: pointer; z-index: 9000;
-      align-items: center; justify-content: center;
+      cursor: pointer; z-index: 9000; align-items: center; justify-content: center;
     }
     body.mobile-mode #mobile-gear {
-      display: flex !important;
-      position: fixed; right: 14px; top: 12px;
+      display: flex !important; position: fixed; right: 14px; top: 12px;
       width: 44px; height: 44px; border-radius: 50%;
       background: var(--bg-elev, #fff); color: var(--text-dim, #968F80);
       border: 1px solid var(--border, #EAE2D3);
@@ -1219,9 +1263,6 @@ function injectMobileCSS() {
       box-shadow: 0 3px 10px rgba(0,0,0,.08); z-index: 9001;
       align-items: center; justify-content: center; padding: 0;
     }
-    body.mobile-mode #mobile-fab:active { transform: scale(.94); }
-    body.mobile-mode #mobile-gear:active { transform: scale(.94); }
-
     @media (max-width: 760px) {
       .overlay { padding: 10px; align-items: flex-end !important; }
       .modal {
@@ -1232,33 +1273,21 @@ function injectMobileCSS() {
       }
       .modal h2 { font-size: 18px; margin-bottom: 16px; }
       .field label { font-size: 12px; }
-      .field input[type=text],
-      .field input[type=number],
-      .field input[type=date],
-      .field input[type=password],
-      .field select,
-      .field textarea {
-        padding: 14px 14px !important;
-        font-size: 16px !important;
-        border-radius: 14px !important;
-        min-height: 50px;
+      .field input[type=text],.field input[type=number],.field input[type=date],
+      .field input[type=password],.field select,.field textarea {
+        padding: 14px 14px !important; font-size: 16px !important;
+        border-radius: 14px !important; min-height: 50px;
       }
       .field-row { flex-direction: column; gap: 12px; }
       .field-row .field { width: 100%; }
       .modal-actions {
-        flex-direction: column-reverse !important;
-        gap: 10px !important;
-        margin-top: 22px !important;
-        position: sticky; bottom: 0;
-        background: var(--bg-elev, #fff);
-        padding-top: 10px;
+        flex-direction: column-reverse !important; gap: 10px !important;
+        margin-top: 22px !important; position: sticky; bottom: 0;
+        background: var(--bg-elev, #fff); padding-top: 10px;
       }
       .modal-actions .btn {
-        width: 100% !important;
-        padding: 16px 18px !important;
-        font-size: 15.5px !important;
-        min-height: 54px;
-        border-radius: 14px !important;
+        width: 100% !important; padding: 16px 18px !important;
+        font-size: 15.5px !important; min-height: 54px; border-radius: 14px !important;
       }
       .icon-btn { min-width: 44px; min-height: 44px; font-size: 18px; }
       .seg { padding: 4px !important; }
@@ -1270,7 +1299,6 @@ function injectMobileCSS() {
   `;
   document.head.appendChild(style);
 }
-
 function injectMobileUI() {
   if (!document.getElementById('mobile-fab')) {
     const fab = document.createElement('button');
@@ -1294,22 +1322,26 @@ function injectMobileUI() {
     document.body.appendChild(gear);
   }
 }
-
 function updateMobileChrome() {
   const gear = document.getElementById('mobile-gear');
   if (!gear) return;
   const settingsActive = document.getElementById('view-settings').classList.contains('active');
   gear.textContent = settingsActive ? '←' : '⚙';
 }
-
 function applyMobileMode() {
   injectMobileCSS();
   injectMobileUI();
   const on = isMobileMode();
   document.body.classList.toggle('mobile-mode', on);
+  if (on) {
+    const settingsActive = document.getElementById('view-settings').classList.contains('active');
+    if (!settingsActive) {
+      const txActive = document.getElementById('view-transactions').classList.contains('active');
+      if (!txActive && typeof showView === 'function') showView('transactions');
+    }
+  }
   updateMobileChrome();
   applyTxVisibility();
-  console.log('[sync] applyMobileMode mobile=' + on + ' ua=' + navigator.userAgent.slice(0, 60));
 }
 
 /* ============================================================
@@ -1327,31 +1359,21 @@ function authHtml() {
         <button id="auth-tab-register" style="flex:1;padding:10px 8px;border:none;background:#F4A83D;color:#fff;font-size:13px;font-weight:600;cursor:pointer;border-radius:11px;margin:2px;">Регистрация</button>
       </div>
       <div id="auth-login-form" style="display:none;">
-        <div style="margin-bottom:12px;">
-          <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
-          <input type="text" id="li-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
-        </div>
-        <div style="margin-bottom:16px;">
-          <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
-          <input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
-        </div>
-        <button id="li-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);min-height:50px;">Войти</button>
+        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
+          <input type="text" id="li-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:16px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
+          <input type="password" id="li-pass" autocomplete="current-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <button id="li-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;min-height:50px;">Войти</button>
         <button id="li-bootstrap" style="width:100%;background:transparent;color:#F4A83D;border:1px solid #F4A83D;padding:13px 18px;border-radius:13px;font-weight:600;font-size:13px;cursor:pointer;margin-top:10px;min-height:48px;">Войти с другого устройства</button>
       </div>
       <div id="auth-register-form">
-        <div style="margin-bottom:12px;">
-          <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
-          <input type="text" id="rg-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
-        </div>
-        <div style="margin-bottom:12px;">
-          <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
-          <input type="password" id="rg-pass" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
-        </div>
-        <div style="margin-bottom:16px;">
-          <label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Повтор пароля</label>
-          <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
-        </div>
-        <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);min-height:50px;">Создать аккаунт</button>
+        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Логин</label>
+          <input type="text" id="rg-login" autocomplete="username" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:12px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Пароль</label>
+          <input type="password" id="rg-pass" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:16px;"><label style="display:block;font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim,#968F80);margin-bottom:6px;font-weight:600;">Повтор пароля</label>
+          <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;"></div>
+        <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;min-height:50px;">Создать аккаунт</button>
       </div>
       <div id="auth-err" style="color:#F2545B;font-size:12.5px;margin-top:12px;text-align:center;min-height:16px;"></div>
     </div>
@@ -1359,22 +1381,14 @@ function authHtml() {
       <div style="background:var(--bg-elev,#fff);border-radius:22px;padding:26px;width:100%;max-width:380px;box-shadow:0 6px 20px rgba(43,38,32,.15);">
         <h2 style="font-family:'Poppins','Segoe UI',sans-serif;font-size:19px;font-weight:700;margin-bottom:14px;color:var(--text,#2B2620);">Подключение с другого устройства</h2>
         <p style="font-size:12.5px;color:var(--text-dim,#968F80);line-height:1.5;margin-bottom:14px;">Введите те же настройки GitHub, что и на первом устройстве.</p>
-        <div style="margin-bottom:10px;">
-          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">GitHub username</label>
-          <input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
-        </div>
-        <div style="margin-bottom:10px;">
-          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Репозиторий</label>
-          <input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
-        </div>
-        <div style="margin-bottom:10px;">
-          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Ветка</label>
-          <input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
-        </div>
-        <div style="margin-bottom:16px;">
-          <label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Token</label>
-          <input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;">
-        </div>
+        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">GitHub username</label>
+          <input type="text" id="bs-user" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Репозиторий</label>
+          <input type="text" id="bs-repo" value="budget-data" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:10px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Ветка</label>
+          <input type="text" id="bs-branch" value="main" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
+        <div style="margin-bottom:16px;"><label style="font-size:11px;text-transform:uppercase;color:var(--text-dim,#968F80);font-weight:600;">Token</label>
+          <input type="password" id="bs-token" placeholder="github_pat_..." style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:12px 12px;border-radius:12px;font-size:16px;margin-top:4px;box-sizing:border-box;"></div>
         <div id="bs-err" style="color:#F2545B;font-size:12.5px;margin-bottom:10px;min-height:14px;"></div>
         <div style="display:flex;gap:8px;flex-direction:column-reverse;">
           <button id="bs-cancel" style="background:var(--bg-elev-2,#F2EDE3);color:var(--text,#2B2620);border:1px solid var(--border,#EAE2D3);padding:14px 16px;border-radius:12px;font-weight:600;font-size:14px;cursor:pointer;width:100%;min-height:50px;">Отмена</button>
@@ -1384,7 +1398,6 @@ function authHtml() {
     </div>
   </div>`;
 }
-
 function injectAuth() {
   if (document.getElementById('auth-screen')) return;
   const wrap = document.createElement('div');
@@ -1394,7 +1407,6 @@ function injectAuth() {
 }
 function showAuth() { injectAuth(); const el = document.getElementById('auth-screen'); if (el) el.style.display = 'flex'; }
 function hideAuth() { const el = document.getElementById('auth-screen'); if (el) el.style.display = 'none'; }
-
 function setAuthTab(tab) {
   const lt = document.getElementById('auth-tab-login');
   const rt = document.getElementById('auth-tab-register');
@@ -1414,7 +1426,6 @@ function setAuthTab(tab) {
     setTimeout(() => document.getElementById('rg-login').focus(), 50);
   }
 }
-
 function wireAuth() {
   document.getElementById('auth-tab-login').onclick = () => setAuthTab('login');
   document.getElementById('auth-tab-register').onclick = () => setAuthTab('register');
@@ -1425,7 +1436,7 @@ function wireAuth() {
     err.textContent = '';
     if (!login || !pass) { err.textContent = 'Заполните логин и пароль'; return; }
     const accs = accounts();
-    if (!accs[login]) { err.textContent = 'Аккаунт не найден. Нажмите «Войти с другого устройства».'; return; }
+    if (!accs[login]) { err.textContent = 'Аккаунт не найден.'; return; }
     const h = await sha256(login + ':' + pass);
     if (h !== accs[login].hash) { err.textContent = 'Неверный пароль'; return; }
     enterAccount(login);
@@ -1482,7 +1493,6 @@ function wireAuth() {
   };
   setAuthTab('login');
 }
-
 function enterAccount(login) {
   currentUser = login;
   saveSession({ login, createdAt: new Date().toISOString() });
@@ -1496,7 +1506,6 @@ function enterAccount(login) {
   setLoadedUser(login);
   location.reload();
 }
-
 function logout() {
   if (!confirm('Выйти из аккаунта?')) return;
   saveSession(null);
@@ -1524,20 +1533,14 @@ function injectGithubCard() {
       Аккаунт: <strong>${currentUser || '—'}</strong>. Токен хранится только в этом браузере.
     </p>
     <div class="field-row">
-      <div class="field"><label>GitHub username</label>
-        <input type="text" id="gh-user" value="${cfg.user || ''}" placeholder="ваш-логин"></div>
-      <div class="field"><label>Репозиторий</label>
-        <input type="text" id="gh-repo" value="${cfg.repo || 'budget-data'}" placeholder="budget-data"></div>
+      <div class="field"><label>GitHub username</label><input type="text" id="gh-user" value="${cfg.user || ''}"></div>
+      <div class="field"><label>Репозиторий</label><input type="text" id="gh-repo" value="${cfg.repo || 'budget-data'}"></div>
     </div>
     <div class="field-row">
-      <div class="field"><label>Ветка</label>
-        <input type="text" id="gh-branch" value="${cfg.branch || 'main'}" placeholder="main"></div>
-      <div class="field"><label>Файл данных</label>
-        <input type="text" id="gh-path" value="${cfg.path || 'data.json'}" placeholder="data.json"></div>
+      <div class="field"><label>Ветка</label><input type="text" id="gh-branch" value="${cfg.branch || 'main'}"></div>
+      <div class="field"><label>Файл данных</label><input type="text" id="gh-path" value="${cfg.path || 'data.json'}"></div>
     </div>
-    <div class="field"><label>Personal Access Token</label>
-      <input type="password" id="gh-token" value="${cfg.token || ''}" placeholder="github_pat_...">
-    </div>
+    <div class="field"><label>Personal Access Token</label><input type="password" id="gh-token" value="${cfg.token || ''}"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;">
       <button class="btn small" id="gh-save">Сохранить</button>
       <button class="btn secondary small" id="gh-push">Отправить</button>
@@ -1556,7 +1559,7 @@ function injectGithubCard() {
     c.token = document.getElementById('gh-token').value.trim();
     ghSaveCfg(c);
     ghSha = null;
-    if (typeof toast === 'function') toast('Настройки сохранены', 'ok');
+    toast('Настройки сохранены', 'ok');
     await pushAccountsFile();
     await ghPullAndMerge();
     ghUpdateStatus();
@@ -1601,6 +1604,7 @@ function boot() {
   hookDeleteHolding();
   setupImmediatePush();
   hookPortfolioHooks();
+  hookFxGlobals();
 
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
   try { window.renderTransactions = renderTransactionsCombined; } catch (e) {}
@@ -1612,9 +1616,17 @@ function boot() {
 
   if (typeof renderAll === 'function') { try { renderAll(); } catch (e) {} }
 
-  setTimeout(() => { applyMobileMode(); }, 250);
-  setTimeout(() => { applyMobileMode(); }, 800);  // повторно после отрисовки
-  setTimeout(() => { applyMobileMode(); }, 2000); // и ещё раз на всякий
+  const tryMobile = () => {
+    if (!isMobileMode()) { applyMobileMode(); return; }
+    if (typeof showView === 'function') {
+      const settingsActive = document.getElementById('view-settings').classList.contains('active');
+      if (!settingsActive) showView('transactions');
+    }
+    applyMobileMode();
+  };
+  setTimeout(tryMobile, 200);
+  setTimeout(tryMobile, 600);
+  setTimeout(tryMobile, 1500);
 
   setTimeout(injectGithubCard, 400);
   setInterval(() => {
@@ -1624,19 +1636,41 @@ function boot() {
   if (typeof window.showView === 'function' && !window.showView.__ghHooked) {
     const origShow = window.showView;
     window.showView = function (id) {
+      if (isMobileMode() && id !== 'settings' && id !== 'transactions') id = 'transactions';
       origShow.call(this, id);
+      if (isMobileMode()) {
+        document.querySelectorAll('.view').forEach(v => {
+          if (v.id !== 'view-' + id) v.classList.remove('active');
+        });
+        const target = document.getElementById('view-' + id);
+        if (target) target.classList.add('active');
+      }
       setTimeout(() => { updateMobileChrome(); applyTxVisibility(); }, 30);
     };
     window.showView.__ghHooked = true;
   }
 
+  // FX-инициализация: первичное обновление + автоповтор
+  setTimeout(async () => {
+    const res = await refreshAllFxRates(false);
+    console.log('[fx] initial refresh', res);
+    if (typeof renderAll === 'function') renderAll();
+  }, 700);
+  startFxAutoRefresh();
+
+  // обновление курсов при возврате на вкладку
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      refreshAllFxRates(false).then(() => {
+        if (typeof renderAll === 'function') renderAll();
+      });
+    }
+  });
+
   const c = ghCfg();
   if (c.token && c.user && c.repo) {
     setTimeout(ghPullAndMerge, 900);
     setInterval(() => { if (document.visibilityState === 'visible') ghPullAndMerge(); }, 120000);
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'visible') ghPullAndMerge();
-    });
   }
 
   window.addEventListener('resize', applyMobileMode);
@@ -1662,6 +1696,12 @@ window.ghSync = {
     off: () => setMobileMode(false),
     on: () => setMobileMode(true),
     refresh: applyMobileMode
+  },
+  fx: {
+    refresh: () => refreshAllFxRates(true).then(r => { renderAll(); return r; }),
+    convert: convertAmount,
+    cache: loadFxCache,
+    clearCache: () => { localStorage.removeItem(FX_CACHE_KEY); }
   },
   goals: {
     add: addGoalFundsModal,
