@@ -1929,14 +1929,14 @@ window.ghSync = {
   }
 };
 
-/* === ЭТИ СТРОКИ ДОБАВЬ === */
-try { window.openDepositModal = openDepositModal; } catch (e) {}
-try { window.closeDeposit = closeDeposit; } catch (e) {}
-try { window.calcDeposit = calcDeposit; } catch (e) {}
-try { window.renderDeposits = renderDeposits; } catch (e) {}
-try { window.depositsList = depositsList; } catch (e) {}
-try { window.openCryptoHoldingModalNew = openCryptoHoldingModalNew; } catch (e) {}
-try { window.searchCryptoLive = searchCryptoLive; } catch (e) {}
-try { window.fetchCryptoTopList = fetchCryptoTopList; } catch (e) {}
+/* ─── ЭКСПОРТ В WINDOW ─── */
+window.openDepositModal = openDepositModal;
+window.closeDeposit = closeDeposit;
+window.calcDeposit = calcDeposit;
+window.renderDeposits = renderDeposits;
+window.depositsList = depositsList;
+window.openCryptoHoldingModalNew = openCryptoHoldingModalNew;
+window.searchCryptoLive = searchCryptoLive;
+window.fetchCryptoTopList = fetchCryptoTopList;
 
 })();
