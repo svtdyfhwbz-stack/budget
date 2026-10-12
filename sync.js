@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — v7 (fix: PC transactions, currency conversion, delete refund)
+   sync.js — v8 (fix tx-table + FAB visibility + FX fallback)
    ============================================================= */
 (function () {
 'use strict';
@@ -15,6 +15,22 @@ const ACCOUNTS_FILE   = 'accounts.json';
 const MOBILE_MODE_KEY = 'budget_mobile_mode_v1';
 const GOAL_CAT_NAME   = 'Цели';
 const PORTFOLIO_CAT_NAME = 'Портфель';
+
+/* Fallback-курсы (на случай, если API недоступны) */
+const FX_FALLBACK = {
+  'USD_EUR': 0.92, 'EUR_USD': 1.087,
+  'USD_RUB': 92.0, 'RUB_USD': 0.0109,
+  'EUR_RUB': 100.0, 'RUB_EUR': 0.010,
+  'USD_GBP': 0.79, 'GBP_USD': 1.27,
+  'USD_KZT': 480.0, 'KZT_USD': 0.0021,
+  'USD_UAH': 41.5, 'UAH_USD': 0.024,
+  'USD_BYN': 3.27, 'BYN_USD': 0.31,
+  'USD_TRY': 34.5, 'TRY_USD': 0.029,
+  'USD_CNY': 7.25, 'CNY_USD': 0.138,
+  'USD_JPY': 155.0, 'JPY_USD': 0.00645,
+  'USD_CHF': 0.88, 'CHF_USD': 1.136,
+  'USD_AED': 3.67, 'AED_USD': 0.272
+};
 
 let currentUser = null;
 let ghSha = null;
@@ -160,7 +176,7 @@ async function ghAtomicPut(path, contentB64, message, cfg) {
   return { ok: false };
 }
 
-/* ---------- accounts.json / data.json ---------- */
+/* ---------- accounts/data sync ---------- */
 async function pushAccountsFile() {
   const cfg = ghCfg();
   if (!cfg.token || !cfg.user || !cfg.repo) return false;
@@ -193,7 +209,7 @@ async function ghPull() {
   catch (e) { return null; }
 }
 async function ghPush(message) {
-  if (pushInFlight) { console.warn('push skipped (in flight)'); return false; }
+  if (pushInFlight) return false;
   pushInFlight = true;
   try {
     const cfg = ghCfg();
@@ -260,8 +276,6 @@ function ghSchedulePush() {
   if (ghPushTimer) clearTimeout(ghPushTimer);
   ghPushTimer = setTimeout(() => { if (ghCfg().token) ghPushNow('auto'); }, 2500 + Math.random() * 1500);
 }
-
-/* ---------- triggers ---------- */
 function triggerImmediatePush(reason) {
   if (!currentUser) return;
   const cfg = ghCfg();
@@ -270,6 +284,30 @@ function triggerImmediatePush(reason) {
   ghPushNow(reason || 'immediate');
 }
 
+/* ---------- conversion ---------- */
+async function convertAmount(amount, fromCur, toCur) {
+  if (!fromCur || !toCur || fromCur === toCur) return amount;
+  let rate = 1;
+  try {
+    if (typeof getFxRate === 'function') {
+      rate = await getFxRate(fromCur, toCur);
+    }
+  } catch (e) { console.warn('convertAmount error', e); }
+  // если rate = 1, а валюты разные — используем fallback-таблицу
+  if (!rate || rate === 1) {
+    const key = fromCur + '_' + toCur;
+    if (FX_FALLBACK[key]) rate = FX_FALLBACK[key];
+    else {
+      // пробуем через USD
+      const k1 = fromCur + '_USD', k2 = 'USD_' + toCur;
+      if (FX_FALLBACK[k1] && FX_FALLBACK[k2]) rate = FX_FALLBACK[k1] * FX_FALLBACK[k2];
+    }
+    console.log('[convert] fallback rate', fromCur, '→', toCur, '=', rate);
+  }
+  return amount * rate;
+}
+
+/* ---------- hooks ---------- */
 function hookPersist() {
   if (typeof persist !== 'function') { setTimeout(hookPersist, 200); return; }
   if (persist.__ghHooked) return;
@@ -326,7 +364,6 @@ function hookDeleteHolding() {
     window[fnName].__ghHooked = true;
     return true;
   };
-
   const okA = wrapDelete('deleteHolding');
   const okB = wrapDelete('deleteCryptoHolding');
   if (!okA || !okB) setTimeout(hookDeleteHolding, 400);
@@ -335,11 +372,9 @@ function hookDeleteHolding() {
 function setupImmediatePush() {
   if (setupImmediatePush.__wired) return;
   setupImmediatePush.__wired = true;
-
   document.addEventListener('click', (e) => {
     const t = e.target;
     if (!t || !t.closest) return;
-
     const saveTx     = t.closest('#tx-save-btn');
     const saveAcc    = t.closest('#acc-save-btn');
     const saveCat    = t.closest('#cat-save-btn');
@@ -347,14 +382,136 @@ function setupImmediatePush() {
     const saveBudget = t.closest('#b-save-btn');
     const saveGoal   = t.closest('#g-save-btn');
     const delBtn     = t.closest('[onclick*="deleteTx"]');
-
     if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !delBtn) return;
     setTimeout(() => triggerImmediatePush(saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data')), 200);
   }, false);
 }
 
 /* ============================================================
-   ACCOUNTS — нативная валюта
+   RENDER: TRANSACTIONS — объединённый (таблица + карточки)
+   ============================================================ */
+function fmtDateShort(d) {
+  try {
+    const dt = new Date(d);
+    const now = new Date();
+    const sameYear = dt.getFullYear() === now.getFullYear();
+    return dt.toLocaleDateString('ru-RU', {
+      day: 'numeric', month: 'short',
+      ...(sameYear ? {} : { year: '2-digit' })
+    });
+  } catch (e) { return d; }
+}
+
+function renderTransactionsCombined() {
+  const tbody = document.getElementById('tx-table');
+  const emptyEl = document.getElementById('tx-empty');
+  const base = state.settings.baseCurrency;
+  const sorted = [...state.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
+  if (emptyEl) emptyEl.style.display = sorted.length ? 'none' : 'block';
+
+  // 1. Обычная таблица (для ПК)
+  if (tbody) {
+    if (sorted.length === 0) tbody.innerHTML = '';
+    else tbody.innerHTML = sorted.map(t => {
+      const acc = accById(t.accountId);
+      const cat = catById(t.categoryId);
+      const cur = acc ? (acc.currency || base) : base;
+      const sign = t.type === 'income' ? '+' : (t.type === 'expense' ? '−' : '');
+      const cls = t.type === 'income' ? 'pos' : (t.type === 'expense' ? 'neg' : '');
+      let accLabel = acc ? acc.name : '—';
+      if (t.type === 'transfer') {
+        const to = accById(t.toAccountId);
+        accLabel = `${acc ? acc.name : '?'} → ${to ? to.name : '?'}`;
+      }
+      return `<tr>
+        <td>${t.date}</td>
+        <td>${accLabel}</td>
+        <td>${cat ? `<span class="tag"><span class="swatch" style="background:${cat.color}"></span>${cat.name}</span>` : '—'}</td>
+        <td style="color:var(--text-dim)">${t.note || ''}</td>
+        <td class="amount ${cls}">${sign}${fmt(t.amount, cur).replace('−', '')}</td>
+        <td>
+          <div class="row-actions">
+            <button class="icon-btn" onclick="editTx('${t.id}')">✎</button>
+            <button class="icon-btn" onclick="deleteTx('${t.id}')">✕</button>
+          </div>
+        </td>
+      </tr>`;
+    }).join('');
+  }
+
+  // 2. Мобильный список (для телефона)
+  const table = tbody ? tbody.parentElement : null;
+  if (table && table.tagName === 'TABLE') {
+    const card = table.parentElement;
+    if (card && !document.getElementById('tx-mobile-list')) {
+      const wrap = document.createElement('div');
+      wrap.id = 'tx-mobile-list';
+      card.insertBefore(wrap, table);
+    }
+  }
+  const wrap = document.getElementById('tx-mobile-list');
+  if (!wrap) return;
+  if (sorted.length === 0) { wrap.innerHTML = ''; return; }
+
+  const groups = new Map();
+  sorted.forEach(t => {
+    const k = t.date;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(t);
+  });
+
+  wrap.innerHTML = [...groups.entries()].map(([date, items]) => {
+    const daySum = items.reduce((s, t) => s + (t.type === 'income' ? t.amount : (t.type === 'expense' ? -t.amount : 0)), 0);
+    const dayCls = daySum >= 0 ? 'pos' : 'neg';
+    const rows = items.map(t => {
+      const acc = accById(t.accountId);
+      const cat = catById(t.categoryId);
+      const cur = acc ? (acc.currency || base) : base;
+      const sign = t.type === 'income' ? '+' : (t.type === 'expense' ? '−' : '↔');
+      const cls = t.type === 'income' ? 'pos' : (t.type === 'expense' ? 'neg' : 'tr');
+      let accLabel = acc ? acc.name : '—';
+      if (t.type === 'transfer') {
+        const to = accById(t.toAccountId);
+        accLabel = `${acc ? acc.name : '?'} → ${to ? to.name : '?'}`;
+      }
+      const catColor = cat ? cat.color : '#8b93a1';
+      const catName = cat ? cat.name : 'Без категории';
+      const noteHtml = t.note ? `<div class="m-tx-note">${t.note}</div>` : '';
+      return `<div class="m-tx-row" data-id="${t.id}">
+        <div class="m-tx-cat">
+          <span class="m-tx-dot" style="background:${catColor}"></span>
+          <span class="m-tx-catname">${catName}</span>
+        </div>
+        <div class="m-tx-meta">
+          <span class="m-tx-acc">${accLabel}</span>
+          ${noteHtml}
+        </div>
+        <div class="m-tx-amt ${cls}">${sign}${fmt(t.amount, cur).replace('−', '')}</div>
+        <div class="m-tx-actions">
+          <button class="m-tx-btn" onclick="event.stopPropagation();editTx('${t.id}')">✎</button>
+          <button class="m-tx-btn m-tx-del" onclick="event.stopPropagation();deleteTx('${t.id}')">✕</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="m-tx-day">
+      <div class="m-tx-dayhead">
+        <span>${fmtDateShort(date)}</span>
+        <span class="${dayCls}">${daySum >= 0 ? '+' : '−'}${fmt(Math.abs(daySum), base).replace('−', '')}</span>
+      </div>
+      ${rows}
+    </div>`;
+  }).join('');
+
+  wrap.querySelectorAll('.m-tx-row').forEach(el => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.id;
+      if (id && typeof editTx === 'function') editTx(id);
+    });
+  });
+}
+
+/* ============================================================
+   ACCOUNTS
    ============================================================ */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -396,101 +553,6 @@ function renderAccountsNative() {
       </div>
     </div>`;
   }).join('');
-}
-
-/* ============================================================
-   TRANSACTIONS mobile (fix: не прячем таблицу inline)
-   ============================================================ */
-function fmtDateShort(d) {
-  try {
-    const dt = new Date(d);
-    const now = new Date();
-    const sameYear = dt.getFullYear() === now.getFullYear();
-    return dt.toLocaleDateString('ru-RU', {
-      day: 'numeric', month: 'short',
-      ...(sameYear ? {} : { year: '2-digit' })
-    });
-  } catch (e) { return d; }
-}
-
-function renderTransactionsMobile() {
-  const list = document.getElementById('tx-table');
-  if (!list) return;
-  const emptyEl = document.getElementById('tx-empty');
-
-  let parent = list.parentElement;
-  if (parent && parent.tagName === 'TABLE') {
-    const card = parent.parentElement;
-    if (card && !document.getElementById('tx-mobile-list')) {
-      const wrap = document.createElement('div');
-      wrap.id = 'tx-mobile-list';
-      card.insertBefore(wrap, parent);
-      // НЕ трогаем style.display — CSS покажет/скроет через body.mobile-mode
-    }
-  }
-
-  const wrap = document.getElementById('tx-mobile-list');
-  if (!wrap) return;
-
-  const sorted = [...state.transactions].sort((a, b) => new Date(b.date) - new Date(a.date));
-  if (emptyEl) emptyEl.style.display = sorted.length ? 'none' : 'block';
-
-  if (sorted.length === 0) { wrap.innerHTML = ''; return; }
-
-  const groups = new Map();
-  sorted.forEach(t => {
-    const k = t.date;
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(t);
-  });
-
-  wrap.innerHTML = [...groups.entries()].map(([date, items]) => {
-    const daySum = items.reduce((s, t) => s + (t.type === 'income' ? t.amount : (t.type === 'expense' ? -t.amount : 0)), 0);
-    const dayCls = daySum >= 0 ? 'pos' : 'neg';
-    const rows = items.map(t => {
-      const acc = accById(t.accountId);
-      const cat = catById(t.categoryId);
-      const sign = t.type === 'income' ? '+' : (t.type === 'expense' ? '−' : '↔');
-      const cls = t.type === 'income' ? 'pos' : (t.type === 'expense' ? 'neg' : 'tr');
-      let accLabel = acc ? acc.name : '—';
-      if (t.type === 'transfer') {
-        const to = accById(t.toAccountId);
-        accLabel = `${acc ? acc.name : '?'} → ${to ? to.name : '?'}`;
-      }
-      const catColor = cat ? cat.color : '#8b93a1';
-      const catName = cat ? cat.name : 'Без категории';
-      const noteHtml = t.note ? `<div class="m-tx-note">${t.note}</div>` : '';
-      return `<div class="m-tx-row" data-id="${t.id}">
-        <div class="m-tx-cat">
-          <span class="m-tx-dot" style="background:${catColor}"></span>
-          <span class="m-tx-catname">${catName}</span>
-        </div>
-        <div class="m-tx-meta">
-          <span class="m-tx-acc">${accLabel}</span>
-          ${noteHtml}
-        </div>
-        <div class="m-tx-amt ${cls}">${sign}${fmt(t.amount).replace('−', '')}</div>
-        <div class="m-tx-actions">
-          <button class="m-tx-btn" onclick="event.stopPropagation();editTx('${t.id}')">✎</button>
-          <button class="m-tx-btn m-tx-del" onclick="event.stopPropagation();deleteTx('${t.id}')">✕</button>
-        </div>
-      </div>`;
-    }).join('');
-    return `<div class="m-tx-day">
-      <div class="m-tx-dayhead">
-        <span>${fmtDateShort(date)}</span>
-        <span class="${dayCls}">${daySum >= 0 ? '+' : '−'}${fmt(Math.abs(daySum)).replace('−', '')}</span>
-      </div>
-      ${rows}
-    </div>`;
-  }).join('');
-
-  wrap.querySelectorAll('.m-tx-row').forEach(el => {
-    el.addEventListener('click', () => {
-      const id = el.dataset.id;
-      if (id && typeof editTx === 'function') editTx(id);
-    });
-  });
 }
 
 /* ============================================================
@@ -657,11 +719,8 @@ function withdrawGoalFundsModal(goalId) {
 }
 
 function goalFormNative(goal) {
-  const g = goal || {
-    name: '', targetAmount: '', initialAmount: 0, deadline: '',
-    color: (typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a',
-    accountId: ''
-  };
+  const g = goal || { name: '', targetAmount: '', initialAmount: 0, deadline: '',
+    color: (typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a', accountId: '' };
   const palette = (typeof PALETTE !== 'undefined') ? PALETTE : ['#d4a54a', '#4fbf8b', '#e36565', '#6fa8d6'];
   const swatches = palette.map(c => `<div class="sw ${g.color === c ? 'sel' : ''}" data-c="${c}" style="background:${c}"></div>`).join('');
   const accs = accountsForGoal();
@@ -702,17 +761,11 @@ function openGoalModalNative(goal) {
     const initial = parseFloat(document.getElementById('g-initial').value) || 0;
     const accountId = document.getElementById('g-account').value || '';
     const deadline = document.getElementById('g-deadline').value || '';
-    const payload = {
-      id: goal ? goal.id : uid(),
-      name, targetAmount, initialAmount: initial,
-      deadline, color, accountId
-    };
+    const payload = { id: goal ? goal.id : uid(), name, targetAmount, initialAmount: initial, deadline, color, accountId };
     if (goal) {
       const idx = state.goals.findIndex(x => x.id === goal.id);
       state.goals[idx] = Object.assign({}, state.goals[idx], payload);
-    } else {
-      state.goals.push(payload);
-    }
+    } else { state.goals.push(payload); }
     persist(); closeModal(); renderAll();
     toast('Цель сохранена', 'ok');
   };
@@ -720,7 +773,6 @@ function openGoalModalNative(goal) {
 
 /* ============================================================
    PORTFOLIO / CRYPTO — покупка и продажа со счёта
-   С учётом конвертации валют
    ============================================================ */
 function getPortfolioCategory() {
   let cat = state.categories.find(c => c.name === PORTFOLIO_CAT_NAME && c.kind === 'expense');
@@ -734,25 +786,12 @@ function getPortfolioCategory() {
 const __stockModalRead  = { payAccId: null, accId: null, shares: null, price: null, ticker: null };
 const __cryptoModalRead = { payAccId: null, accId: null, amount: null, price: null, ticker: null };
 
-/* Универсальная конвертация из одной валюты в другую */
-async function convertAmount(amount, fromCur, toCur) {
-  if (!fromCur || !toCur || fromCur === toCur) return amount;
-  try {
-    if (typeof getFxRate === 'function') {
-      const rate = await getFxRate(fromCur, toCur);
-      return amount * rate;
-    }
-  } catch (e) { console.warn('convertAmount failed', e); }
-  return amount;
-}
-
 function enhanceStockModal() {
   if (document.getElementById('sp-payacc-field')) return;
   const modal = document.getElementById('modal');
   if (!modal) return;
   const saveBtn = document.getElementById('sp-save-btn');
   if (!saveBtn) return;
-
   const h2 = modal.querySelector('h2');
   if (h2 && /Изменить/i.test(h2.textContent)) return;
 
@@ -772,11 +811,10 @@ function enhanceStockModal() {
   field.innerHTML = `
     <label>Списать со счёта</label>
     <select id="sp-payacc">${opts}</select>
-    <div class="hint">Сумма = кол-во × цена. Если валюта портфеля и счёта разные, сумма конвертируется автоматически.</div>`;
+    <div class="hint">Сумма спишется с выбранного счёта. Если валюта отличается — конвертируется.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
 
-  // capture — читаем ДО закрытия модалки
   saveBtn.addEventListener('click', () => {
     __stockModalRead.payAccId = (document.getElementById('sp-payacc') || {}).value || null;
     __stockModalRead.accId    = (document.getElementById('sp-account') || {}).value || null;
@@ -785,7 +823,6 @@ function enhanceStockModal() {
     __stockModalRead.ticker   = ((document.getElementById('sp-ticker') || {}).value || '').trim().toUpperCase();
   }, true);
 
-  // bubble — после закрытия модалки
   saveBtn.addEventListener('click', () => {
     setTimeout(async () => {
       if (document.getElementById('overlay').classList.contains('active')) return;
@@ -801,7 +838,6 @@ function enhanceStockModal() {
       const totalInStockCur = v.shares * v.price;
       const totalInAccCur = await convertAmount(totalInStockCur, stockCur, accCur);
 
-      // ищем только что добавленную позицию (последняя с этим тикером)
       const candidates = (stockAcc.holdings || []).filter(h => h.ticker === v.ticker);
       const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
 
@@ -816,7 +852,9 @@ function enhanceStockModal() {
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') toast('Списано: ' + fmt(totalInAccCur, accCur), 'ok');
+      if (typeof toast === 'function') {
+        toast(`Списано ${fmt(totalInAccCur, accCur)} (${fmt(totalInStockCur, stockCur)})`, 'ok');
+      }
     }, 150);
   });
 }
@@ -827,7 +865,6 @@ function enhanceCryptoModal() {
   if (!modal) return;
   const saveBtn = document.getElementById('crypto-save-btn');
   if (!saveBtn) return;
-
   const h2 = modal.querySelector('h2');
   if (h2 && /Изменить/i.test(h2.textContent)) return;
 
@@ -847,7 +884,7 @@ function enhanceCryptoModal() {
   field.innerHTML = `
     <label>Списать со счёта</label>
     <select id="crypto-payacc">${opts}</select>
-    <div class="hint">Сумма = кол-во × цена. Если валюта крипто-кошелька и счёта разные, сумма конвертируется автоматически.</div>`;
+    <div class="hint">Сумма спишется с выбранного счёта. Если валюта отличается — конвертируется.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
 
@@ -889,7 +926,9 @@ function enhanceCryptoModal() {
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') toast('Списано: ' + fmt(totalInAccCur, accCur), 'ok');
+      if (typeof toast === 'function') {
+        toast(`Списано ${fmt(totalInAccCur, accCur)} (${fmt(totalInCryptoCur, cryptoCur)})`, 'ok');
+      }
     }, 150);
   });
 }
@@ -901,16 +940,14 @@ function sellStockModal(accId, holdId) {
   if (!hold) return;
 
   const payAccounts = state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
-  if (payAccounts.length === 0) { toast('Нет счетов для получения денег', 'err'); return; }
+  if (payAccounts.length === 0) { toast('Нет счетов', 'err'); return; }
   const base = state.settings.baseCurrency;
   const cur = acc.currency || 'USD';
-
   const opts = payAccounts.map(a => {
     const acur = a.currency || base;
     const bal = cashAccountBalance(a);
     return `<option value="${a.id}">${a.name} — ${fmt(bal, acur)}</option>`;
   }).join('');
-
   const priceDefault = hold.lastPrice != null ? hold.lastPrice : hold.buyPrice;
 
   openModal(`
@@ -923,7 +960,6 @@ function sellStockModal(accId, holdId) {
       <input type="number" step="any" id="ss-price" value="${priceDefault}"></div>
     <div class="field"><label>Зачислить на счёт</label>
       <select id="ss-account">${opts}</select></div>
-    <div class="hint">Деньги придут на выбранный счёт. В портфеле позиция уменьшится.</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="ss-save-btn">Продать</button>
@@ -938,10 +974,8 @@ function sellStockModal(accId, holdId) {
     if (!(price > 0)) { toast('Укажите цену', 'err'); return; }
     const dest = accById(destAccId);
     if (!dest) return;
-
     const destCur = dest.currency || base;
-    const totalStockCur = sharesToSell * price;
-    const totalDestCur = await convertAmount(totalStockCur, cur, destCur);
+    const totalDestCur = await convertAmount(sharesToSell * price, cur, destCur);
 
     const idx = acc.holdings.findIndex(h => h.id === holdId);
     if (idx === -1) return;
@@ -955,7 +989,6 @@ function sellStockModal(accId, holdId) {
       accountId: destAccId, categoryId: cat.id,
       note: 'Продажа ' + hold.ticker
     });
-
     persist(); closeModal(); renderAll();
     toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
@@ -972,13 +1005,11 @@ function sellCryptoModal(accId, holdId) {
   if (payAccounts.length === 0) { toast('Нет счетов', 'err'); return; }
   const base = state.settings.baseCurrency;
   const cur = (acc.crypto && acc.crypto.currency) || base;
-
   const opts = payAccounts.map(a => {
     const acur = a.currency || base;
     const bal = cashAccountBalance(a);
     return `<option value="${a.id}">${a.name} — ${fmt(bal, acur)}</option>`;
   }).join('');
-
   const priceDefault = hold.lastPrice != null ? hold.lastPrice : hold.buyPrice;
 
   openModal(`
@@ -991,7 +1022,6 @@ function sellCryptoModal(accId, holdId) {
       <input type="number" step="any" id="sc-price" value="${priceDefault}"></div>
     <div class="field"><label>Зачислить на счёт</label>
       <select id="sc-account">${opts}</select></div>
-    <div class="hint">Деньги придут на счёт. Позиция уменьшится.</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="sc-save-btn">Продать</button>
@@ -1006,10 +1036,8 @@ function sellCryptoModal(accId, holdId) {
     if (!(price > 0)) { toast('Укажите цену', 'err'); return; }
     const dest = accById(destAccId);
     if (!dest) return;
-
     const destCur = dest.currency || base;
-    const totalCryptoCur = amtToSell * price;
-    const totalDestCur = await convertAmount(totalCryptoCur, cur, destCur);
+    const totalDestCur = await convertAmount(amtToSell * price, cur, destCur);
 
     const idx = list.findIndex(h => h.id === holdId);
     if (idx === -1) return;
@@ -1025,7 +1053,6 @@ function sellCryptoModal(accId, holdId) {
       accountId: destAccId, categoryId: cat.id,
       note: 'Продажа ' + hold.ticker
     });
-
     persist(); closeModal(); renderAll();
     toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
@@ -1107,7 +1134,6 @@ function hookPortfolioHooks() {
    MOBILE MODE
    ============================================================ */
 function isMobileDevice() {
-  if (window.matchMedia && window.matchMedia('(max-width: 760px)').matches) return true;
   return /Android|iPhone|iPad|iPod|Opera Mini|IEMobile|WPDesktop/i.test(navigator.userAgent);
 }
 function isMobileMode() {
@@ -1124,13 +1150,13 @@ function injectMobileCSS() {
   const style = document.createElement('style');
   style.id = 'mobile-mode-css';
   style.textContent = `
+    /* ==== МОБИЛЬНЫЙ РЕЖИМ ==== */
     body.mobile-mode .sidebar { display: none !important; }
     body.mobile-mode .main { padding: 12px 12px 110px; max-width: 100%; }
     body.mobile-mode .view { display: none !important; }
     body.mobile-mode #view-transactions.active { display: block !important; }
     body.mobile-mode #view-settings.active {
-      display: block !important;
-      padding: 12px 12px 100px;
+      display: block !important; padding: 12px 12px 100px;
     }
     body.mobile-mode #view-settings .page-head { padding-right: 56px; }
     body.mobile-mode #view-settings .page-head h1 { font-size: 20px; }
@@ -1146,8 +1172,10 @@ function injectMobileCSS() {
       background: transparent; border: none; padding: 0; box-shadow: none;
     }
     body.mobile-mode #tx-table { display: none !important; }
+    body.mobile-mode table:has(#tx-table) { display: none !important; }
     body.mobile-mode #tx-empty { padding: 30px 16px; }
 
+    /* мобильный список виден только в мобильном режиме */
     #tx-mobile-list { display: none; }
     body.mobile-mode #tx-mobile-list { display: block; }
 
@@ -1171,43 +1199,26 @@ function injectMobileCSS() {
       border-radius: 14px;
       margin-bottom: 6px;
       cursor: pointer;
-      transition: background .12s, transform .08s;
     }
-    .m-tx-row:active { background: var(--bg-elev-2, #F2EDE3); transform: scale(.99); }
-    .m-tx-cat {
-      grid-area: cat;
-      display: flex; align-items: center; gap: 8px;
-      font-size: 14px; font-weight: 600; color: var(--text, #2B2620);
-      min-width: 0;
-    }
+    .m-tx-row:active { background: var(--bg-elev-2, #F2EDE3); }
+    .m-tx-cat { grid-area: cat; display: flex; align-items: center; gap: 8px;
+      font-size: 14px; font-weight: 600; color: var(--text, #2B2620); min-width: 0; }
     .m-tx-dot { width: 10px; height: 10px; border-radius: 50%; flex: none; }
     .m-tx-catname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .m-tx-meta {
-      grid-area: meta;
-      display: flex; flex-direction: column; gap: 2px;
-      font-size: 11.5px; color: var(--text-dim, #968F80);
-      min-width: 0; padding-left: 18px;
-    }
+    .m-tx-meta { grid-area: meta; display: flex; flex-direction: column; gap: 2px;
+      font-size: 11.5px; color: var(--text-dim, #968F80); min-width: 0; padding-left: 18px; }
     .m-tx-acc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .m-tx-note {
-      font-style: italic;
-      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-      opacity: .85;
-    }
-    .m-tx-amt {
-      grid-area: amt;
-      font-family: var(--font-mono, monospace);
-      font-weight: 700;
-      font-size: 15px;
-      font-variant-numeric: tabular-nums;
-      white-space: nowrap;
-      align-self: center;
-    }
+    .m-tx-note { font-style: italic; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; opacity: .85; }
+    .m-tx-amt { grid-area: amt; font-family: var(--font-mono, monospace); font-weight: 700;
+      font-size: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; align-self: center; }
     .m-tx-amt.pos { color: var(--green, #2FBF71); }
     .m-tx-amt.neg { color: var(--red, #F2545B); }
     .m-tx-amt.tr  { color: var(--text-dim, #968F80); font-weight: 600; }
 
-    #mobile-fab {
+    /* ==== FAB + GEAR — ТОЛЬКО в мобильном режиме ==== */
+    #mobile-fab, #mobile-gear { display: none !important; }
+    body.mobile-mode #mobile-fab {
+      display: flex !important;
       position: fixed; right: 18px; bottom: 22px;
       width: 64px; height: 64px; border-radius: 50%;
       background: #F4A83D; color: #fff; border: none;
@@ -1215,23 +1226,19 @@ function injectMobileCSS() {
       box-shadow: 0 6px 22px rgba(244,168,61,.5);
       cursor: pointer; z-index: 9000;
       align-items: center; justify-content: center;
-      display: none;
     }
-    #mobile-fab.on { display: flex; }
-    #mobile-fab:active { transform: scale(.94); }
-
-    #mobile-gear {
+    body.mobile-mode #mobile-gear {
+      display: flex !important;
       position: fixed; right: 14px; top: 12px;
       width: 44px; height: 44px; border-radius: 50%;
       background: var(--bg-elev, #fff); color: var(--text-dim, #968F80);
       border: 1px solid var(--border, #EAE2D3);
       font-size: 20px; line-height: 1; cursor: pointer;
       box-shadow: 0 3px 10px rgba(0,0,0,.08); z-index: 9001;
-      display: none; align-items: center; justify-content: center;
-      padding: 0;
+      align-items: center; justify-content: center; padding: 0;
     }
-    #mobile-gear.on { display: flex; }
-    #mobile-gear:active { transform: scale(.94); }
+    body.mobile-mode #mobile-fab:active { transform: scale(.94); }
+    body.mobile-mode #mobile-gear:active { transform: scale(.94); }
 
     @media (max-width: 760px) {
       .overlay { padding: 10px; align-items: flex-end !important; }
@@ -1276,16 +1283,8 @@ function injectMobileCSS() {
       }
       .icon-btn { min-width: 44px; min-height: 44px; font-size: 18px; }
       .seg { padding: 4px !important; }
-      .seg button {
-        padding: 12px 6px !important;
-        font-size: 13px !important;
-        min-height: 44px;
-      }
-      .category-option {
-        padding: 12px 14px !important;
-        font-size: 14px !important;
-        min-height: 46px;
-      }
+      .seg button { padding: 12px 6px !important; font-size: 13px !important; min-height: 44px; }
+      .category-option { padding: 12px 14px !important; font-size: 14px !important; min-height: 46px; }
       .btn { min-height: 44px; }
       .btn.small { min-height: 40px; }
     }
@@ -1324,37 +1323,16 @@ function injectMobileUI() {
 
 function updateMobileChrome() {
   const gear = document.getElementById('mobile-gear');
-  const fab = document.getElementById('mobile-fab');
-  if (!gear || !fab) return;
+  if (!gear) return;
   const settingsActive = document.getElementById('view-settings').classList.contains('active');
   gear.textContent = settingsActive ? '←' : '⚙';
-  if (settingsActive) fab.classList.remove('on');
-  else fab.classList.add('on');
 }
 
 function applyMobileMode() {
   injectMobileCSS();
   injectMobileUI();
   const on = isMobileMode();
-  const mobile = isMobileDevice();
   document.body.classList.toggle('mobile-mode', on);
-
-  const gear = document.getElementById('mobile-gear');
-  const fab = document.getElementById('mobile-fab');
-
-  if (!mobile) {
-    gear.classList.remove('on');
-    fab.classList.remove('on');
-    return;
-  }
-  gear.classList.add('on');
-
-  if (on) {
-    if (typeof showView === 'function') {
-      const cur = document.querySelector('.view.active');
-      if (!cur) showView('transactions');
-    }
-  }
   updateMobileChrome();
 }
 
@@ -1648,8 +1626,9 @@ function boot() {
   setupImmediatePush();
   hookPortfolioHooks();
 
+  // переопределяем рендеры
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
-  try { window.renderTransactions = renderTransactionsMobile; } catch (e) {}
+  try { window.renderTransactions = renderTransactionsCombined; } catch (e) {}
   try { window.renderGoals = renderGoalsNative; } catch (e) {}
   try { window.addGoalFunds = addGoalFundsModal; } catch (e) {}
   try { window.withdrawGoalFunds = withdrawGoalFundsModal; } catch (e) {}
@@ -1683,11 +1662,7 @@ function boot() {
     });
   }
 
-  let rz = null;
-  window.addEventListener('resize', () => {
-    if (rz) clearTimeout(rz);
-    rz = setTimeout(applyMobileMode, 200);
-  });
+  window.addEventListener('resize', applyMobileMode);
   window.addEventListener('orientationchange', applyMobileMode);
 }
 
