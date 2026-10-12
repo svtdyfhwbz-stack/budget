@@ -1,6 +1,5 @@
 /* =============================================================
-   sync.js — Multi-account + GitHub sync + Mobile + Goals + Portfolio
-   v6 — final
+   sync.js — v7 (fix: PC transactions, currency conversion, delete refund)
    ============================================================= */
 (function () {
 'use strict';
@@ -298,6 +297,41 @@ function hookDeleteTx() {
   window.deleteTx.__ghHooked = true;
 }
 
+function hookDeleteHolding() {
+  const wrapDelete = (fnName) => {
+    if (typeof window[fnName] !== 'function') return false;
+    if (window[fnName].__ghHooked) return true;
+    const orig = window[fnName];
+    window[fnName] = function (accId, holdIdOrIds) {
+      const r = orig.apply(this, arguments);
+      setTimeout(() => {
+        const holdIds = String(holdIdOrIds || '').split(',').map(s => s.trim()).filter(Boolean);
+        if (holdIds.length === 0) return;
+        const before = state.transactions.length;
+        state.transactions = state.transactions.filter(t =>
+          !(t.holdingId && holdIds.includes(t.holdingId))
+        );
+        const removed = before - state.transactions.length;
+        if (removed > 0) {
+          persist();
+          renderAll();
+          triggerImmediatePush('holding-delete');
+          if (typeof toast === 'function') {
+            toast('Удалено транзакций покупки: ' + removed + '. Деньги вернулись на счёт.', 'ok');
+          }
+        }
+      }, 100);
+      return r;
+    };
+    window[fnName].__ghHooked = true;
+    return true;
+  };
+
+  const okA = wrapDelete('deleteHolding');
+  const okB = wrapDelete('deleteCryptoHolding');
+  if (!okA || !okB) setTimeout(hookDeleteHolding, 400);
+}
+
 function setupImmediatePush() {
   if (setupImmediatePush.__wired) return;
   setupImmediatePush.__wired = true;
@@ -365,7 +399,7 @@ function renderAccountsNative() {
 }
 
 /* ============================================================
-   TRANSACTIONS mobile
+   TRANSACTIONS mobile (fix: не прячем таблицу inline)
    ============================================================ */
 function fmtDateShort(d) {
   try {
@@ -391,7 +425,7 @@ function renderTransactionsMobile() {
       const wrap = document.createElement('div');
       wrap.id = 'tx-mobile-list';
       card.insertBefore(wrap, parent);
-      parent.style.display = 'none';
+      // НЕ трогаем style.display — CSS покажет/скроет через body.mobile-mode
     }
   }
 
@@ -460,7 +494,7 @@ function renderTransactionsMobile() {
 }
 
 /* ============================================================
-   GOALS — пополнение со счёта
+   GOALS
    ============================================================ */
 function computeGoalBalance(g) {
   const initial = Number(g.initialAmount || 0);
@@ -686,6 +720,7 @@ function openGoalModalNative(goal) {
 
 /* ============================================================
    PORTFOLIO / CRYPTO — покупка и продажа со счёта
+   С учётом конвертации валют
    ============================================================ */
 function getPortfolioCategory() {
   let cat = state.categories.find(c => c.name === PORTFOLIO_CAT_NAME && c.kind === 'expense');
@@ -696,8 +731,20 @@ function getPortfolioCategory() {
   return cat;
 }
 
-const __stockModalRead  = { payAccId: null, shares: null, price: null, ticker: null };
-const __cryptoModalRead = { payAccId: null, amount: null, price: null, ticker: null };
+const __stockModalRead  = { payAccId: null, accId: null, shares: null, price: null, ticker: null };
+const __cryptoModalRead = { payAccId: null, accId: null, amount: null, price: null, ticker: null };
+
+/* Универсальная конвертация из одной валюты в другую */
+async function convertAmount(amount, fromCur, toCur) {
+  if (!fromCur || !toCur || fromCur === toCur) return amount;
+  try {
+    if (typeof getFxRate === 'function') {
+      const rate = await getFxRate(fromCur, toCur);
+      return amount * rate;
+    }
+  } catch (e) { console.warn('convertAmount failed', e); }
+  return amount;
+}
 
 function enhanceStockModal() {
   if (document.getElementById('sp-payacc-field')) return;
@@ -725,33 +772,52 @@ function enhanceStockModal() {
   field.innerHTML = `
     <label>Списать со счёта</label>
     <select id="sp-payacc">${opts}</select>
-    <div class="hint">Сумма = кол-во × цена. Спишется с выбранного счёта (категория «Портфель»).</div>`;
+    <div class="hint">Сумма = кол-во × цена. Если валюта портфеля и счёта разные, сумма конвертируется автоматически.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
 
+  // capture — читаем ДО закрытия модалки
   saveBtn.addEventListener('click', () => {
     __stockModalRead.payAccId = (document.getElementById('sp-payacc') || {}).value || null;
-    __stockModalRead.shares  = parseFloat((document.getElementById('sp-shares') || {}).value) || 0;
-    __stockModalRead.price   = parseFloat((document.getElementById('sp-price')  || {}).value) || 0;
-    __stockModalRead.ticker  = ((document.getElementById('sp-ticker') || {}).value || '').trim().toUpperCase();
+    __stockModalRead.accId    = (document.getElementById('sp-account') || {}).value || null;
+    __stockModalRead.shares   = parseFloat((document.getElementById('sp-shares') || {}).value) || 0;
+    __stockModalRead.price    = parseFloat((document.getElementById('sp-price')  || {}).value) || 0;
+    __stockModalRead.ticker   = ((document.getElementById('sp-ticker') || {}).value || '').trim().toUpperCase();
   }, true);
 
+  // bubble — после закрытия модалки
   saveBtn.addEventListener('click', () => {
-    setTimeout(() => {
+    setTimeout(async () => {
       if (document.getElementById('overlay').classList.contains('active')) return;
       const v = __stockModalRead;
-      if (!v.payAccId || !v.shares || !v.price || !v.ticker) return;
+      if (!v.payAccId || !v.shares || !v.price || !v.ticker || !v.accId) return;
+
+      const buyAcc = accById(v.payAccId);
+      const stockAcc = accById(v.accId);
+      if (!buyAcc || !stockAcc) return;
+
+      const stockCur = stockAcc.currency || 'USD';
+      const accCur = buyAcc.currency || state.settings.baseCurrency;
+      const totalInStockCur = v.shares * v.price;
+      const totalInAccCur = await convertAmount(totalInStockCur, stockCur, accCur);
+
+      // ищем только что добавленную позицию (последняя с этим тикером)
+      const candidates = (stockAcc.holdings || []).filter(h => h.ticker === v.ticker);
+      const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
+
       const cat = getPortfolioCategory();
       state.transactions.push({
         id: uid(), type: 'expense', date: todayStr(),
-        amount: v.shares * v.price,
+        amount: totalInAccCur,
         accountId: v.payAccId, categoryId: cat.id,
-        note: 'Покупка ' + v.ticker
+        note: 'Покупка ' + v.ticker,
+        holdingId: holdingId,
+        holdingAccId: v.accId
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') toast('Списано: ' + fmt(v.shares * v.price), 'ok');
-    }, 100);
+      if (typeof toast === 'function') toast('Списано: ' + fmt(totalInAccCur, accCur), 'ok');
+    }, 150);
   });
 }
 
@@ -781,33 +847,50 @@ function enhanceCryptoModal() {
   field.innerHTML = `
     <label>Списать со счёта</label>
     <select id="crypto-payacc">${opts}</select>
-    <div class="hint">Сумма = кол-во × цена. Спишется с выбранного счёта.</div>`;
+    <div class="hint">Сумма = кол-во × цена. Если валюта крипто-кошелька и счёта разные, сумма конвертируется автоматически.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
 
   saveBtn.addEventListener('click', () => {
     __cryptoModalRead.payAccId = (document.getElementById('crypto-payacc') || {}).value || null;
-    __cryptoModalRead.amount  = parseFloat((document.getElementById('crypto-amount') || {}).value) || 0;
-    __cryptoModalRead.price   = parseFloat((document.getElementById('crypto-buy-price') || {}).value) || 0;
-    __cryptoModalRead.ticker  = ((document.getElementById('crypto-search') || {}).value || '').trim().toUpperCase();
+    __cryptoModalRead.accId    = (document.getElementById('crypto-account') || {}).value || null;
+    __cryptoModalRead.amount   = parseFloat((document.getElementById('crypto-amount') || {}).value) || 0;
+    __cryptoModalRead.price    = parseFloat((document.getElementById('crypto-buy-price') || {}).value) || 0;
+    __cryptoModalRead.ticker   = ((document.getElementById('crypto-search') || {}).value || '').trim().toUpperCase();
   }, true);
 
   saveBtn.addEventListener('click', () => {
-    setTimeout(() => {
+    setTimeout(async () => {
       if (document.getElementById('overlay').classList.contains('active')) return;
       const v = __cryptoModalRead;
-      if (!v.payAccId || !v.amount || !v.price || !v.ticker) return;
+      if (!v.payAccId || !v.amount || !v.price || !v.ticker || !v.accId) return;
+
+      const buyAcc = accById(v.payAccId);
+      const cryptoAcc = accById(v.accId);
+      if (!buyAcc || !cryptoAcc) return;
+
+      const cryptoCur = (cryptoAcc.crypto && cryptoAcc.crypto.currency) || state.settings.baseCurrency;
+      const accCur = buyAcc.currency || state.settings.baseCurrency;
+      const totalInCryptoCur = v.amount * v.price;
+      const totalInAccCur = await convertAmount(totalInCryptoCur, cryptoCur, accCur);
+
+      const list = (cryptoAcc.crypto && cryptoAcc.crypto.holdings) || [];
+      const candidates = list.filter(h => h.ticker === v.ticker);
+      const holdingId = candidates.length > 0 ? candidates[candidates.length - 1].id : null;
+
       const cat = getPortfolioCategory();
       state.transactions.push({
         id: uid(), type: 'expense', date: todayStr(),
-        amount: v.amount * v.price,
+        amount: totalInAccCur,
         accountId: v.payAccId, categoryId: cat.id,
-        note: 'Покупка ' + v.ticker
+        note: 'Покупка ' + v.ticker,
+        holdingId: holdingId,
+        holdingAccId: v.accId
       });
       persist();
       if (typeof renderAll === 'function') renderAll();
-      if (typeof toast === 'function') toast('Списано: ' + fmt(v.amount * v.price), 'ok');
-    }, 100);
+      if (typeof toast === 'function') toast('Списано: ' + fmt(totalInAccCur, accCur), 'ok');
+    }, 150);
   });
 }
 
@@ -846,7 +929,7 @@ function sellStockModal(accId, holdId) {
       <button class="btn" id="ss-save-btn">Продать</button>
     </div>`);
 
-  document.getElementById('ss-save-btn').onclick = () => {
+  document.getElementById('ss-save-btn').onclick = async () => {
     const sharesToSell = parseFloat(document.getElementById('ss-shares').value);
     const price = parseFloat(document.getElementById('ss-price').value);
     const destAccId = document.getElementById('ss-account').value;
@@ -856,6 +939,10 @@ function sellStockModal(accId, holdId) {
     const dest = accById(destAccId);
     if (!dest) return;
 
+    const destCur = dest.currency || base;
+    const totalStockCur = sharesToSell * price;
+    const totalDestCur = await convertAmount(totalStockCur, cur, destCur);
+
     const idx = acc.holdings.findIndex(h => h.id === holdId);
     if (idx === -1) return;
     if (sharesToSell >= hold.shares) acc.holdings.splice(idx, 1);
@@ -864,13 +951,13 @@ function sellStockModal(accId, holdId) {
     const cat = getPortfolioCategory();
     state.transactions.push({
       id: uid(), type: 'income', date: todayStr(),
-      amount: sharesToSell * price,
+      amount: totalDestCur,
       accountId: destAccId, categoryId: cat.id,
       note: 'Продажа ' + hold.ticker
     });
 
     persist(); closeModal(); renderAll();
-    toast('Продано на ' + fmt(sharesToSell * price, dest.currency || base), 'ok');
+    toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
 }
 
@@ -910,7 +997,7 @@ function sellCryptoModal(accId, holdId) {
       <button class="btn" id="sc-save-btn">Продать</button>
     </div>`);
 
-  document.getElementById('sc-save-btn').onclick = () => {
+  document.getElementById('sc-save-btn').onclick = async () => {
     const amtToSell = parseFloat(document.getElementById('sc-amount').value);
     const price = parseFloat(document.getElementById('sc-price').value);
     const destAccId = document.getElementById('sc-account').value;
@@ -918,6 +1005,11 @@ function sellCryptoModal(accId, holdId) {
     if (amtToSell > hold.amount) { toast('Больше, чем в наличии', 'err'); return; }
     if (!(price > 0)) { toast('Укажите цену', 'err'); return; }
     const dest = accById(destAccId);
+    if (!dest) return;
+
+    const destCur = dest.currency || base;
+    const totalCryptoCur = amtToSell * price;
+    const totalDestCur = await convertAmount(totalCryptoCur, cur, destCur);
 
     const idx = list.findIndex(h => h.id === holdId);
     if (idx === -1) return;
@@ -929,13 +1021,13 @@ function sellCryptoModal(accId, holdId) {
     const cat = getPortfolioCategory();
     state.transactions.push({
       id: uid(), type: 'income', date: todayStr(),
-      amount: amtToSell * price,
+      amount: totalDestCur,
       accountId: destAccId, categoryId: cat.id,
       note: 'Продажа ' + hold.ticker
     });
 
     persist(); closeModal(); renderAll();
-    toast('Продано на ' + fmt(amtToSell * price, dest.currency || base), 'ok');
+    toast('Продано на ' + fmt(totalDestCur, destCur), 'ok');
   };
 }
 
@@ -1552,6 +1644,7 @@ function boot() {
   hideAuth();
   hookPersist();
   hookDeleteTx();
+  hookDeleteHolding();
   setupImmediatePush();
   hookPortfolioHooks();
 
