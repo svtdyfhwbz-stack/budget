@@ -1,6 +1,6 @@
 /* =============================================================
-   sync.js — Multi-account + GitHub sync + Mobile v5
-   v5: пополнение целей со счёта, вывод обратно
+   sync.js — Multi-account + GitHub sync + Mobile + Goals + Portfolio
+   v6 — final
    ============================================================= */
 (function () {
 'use strict';
@@ -15,6 +15,7 @@ const GH_API          = 'https://api.github.com';
 const ACCOUNTS_FILE   = 'accounts.json';
 const MOBILE_MODE_KEY = 'budget_mobile_mode_v1';
 const GOAL_CAT_NAME   = 'Цели';
+const PORTFOLIO_CAT_NAME = 'Портфель';
 
 let currentUser = null;
 let ghSha = null;
@@ -319,7 +320,7 @@ function setupImmediatePush() {
 }
 
 /* ============================================================
-   ACCOUNTS
+   ACCOUNTS — нативная валюта
    ============================================================ */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -472,7 +473,6 @@ function computeGoalBalance(g) {
   });
   return initial + fromTx;
 }
-
 function getGoalCategory() {
   let cat = state.categories.find(c => c.name === GOAL_CAT_NAME && c.kind === 'expense');
   if (!cat) {
@@ -481,11 +481,9 @@ function getGoalCategory() {
   }
   return cat;
 }
-
 function accountsForGoal() {
   return state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
 }
-
 function renderGoalsNative() {
   const grid = document.getElementById('goals-grid');
   if (!grid) return;
@@ -522,15 +520,11 @@ function renderGoalsNative() {
   }).join('');
 }
 
-/* Модалка: внести сумму в цель */
 function addGoalFundsModal(goalId) {
   const g = state.goals.find(x => x.id === goalId);
   if (!g) return;
   const accs = accountsForGoal();
-  if (accs.length === 0) {
-    if (typeof toast === 'function') toast('Нет доступных счетов (нужен наличный или банковский)', 'err');
-    return;
-  }
+  if (accs.length === 0) { toast('Нет счетов (нужен наличный или банковский)', 'err'); return; }
   const base = state.settings.baseCurrency;
   const accOpts = accs.map(a => {
     const cur = a.currency || base;
@@ -538,32 +532,22 @@ function addGoalFundsModal(goalId) {
     const sel = (g.accountId === a.id) ? 'selected' : '';
     return `<option value="${a.id}" ${sel}>${a.name} — ${fmt(bal, cur)}</option>`;
   }).join('');
-
   const current = computeGoalBalance(g);
   const remain = Math.max(0, g.targetAmount - current);
 
   openModal(`
     <h2>Пополнить цель</h2>
-    <div class="field">
-      <label>Цель</label>
-      <input type="text" value="${g.name}" disabled>
-    </div>
-    <div class="field">
-      <label>Сумма пополнения</label>
-      <input type="number" step="0.01" id="gf-amount" value="${remain > 0 ? remain.toFixed(2) : ''}" placeholder="0.00">
-    </div>
-    <div class="field">
-      <label>Со счёта</label>
+    <div class="field"><label>Цель</label><input type="text" value="${g.name}" disabled></div>
+    <div class="field"><label>Сумма пополнения</label>
+      <input type="number" step="0.01" id="gf-amount" value="${remain > 0 ? remain.toFixed(2) : ''}" placeholder="0.00"></div>
+    <div class="field"><label>Со счёта</label>
       <select id="gf-account">${accOpts}</select>
-      <div class="hint">Сумма спишется со счёта и попадёт в накопления цели.</div>
-    </div>
+      <div class="hint">Сумма спишется со счёта и попадёт в накопления цели.</div></div>
     <div class="hint">Уже накоплено: <strong>${fmt(current)}</strong> из ${fmt(g.targetAmount)}</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="gf-save-btn">Внести</button>
-    </div>
-  `);
-
+    </div>`);
   setTimeout(() => {
     const inp = document.getElementById('gf-amount');
     if (inp) { inp.focus(); inp.select(); }
@@ -582,24 +566,15 @@ function addGoalFundsModal(goalId) {
     }
     const cat = getGoalCategory();
     state.transactions.push({
-      id: uid(),
-      type: 'expense',
-      date: todayStr(),
-      amount: amt,
-      accountId: accId,
-      categoryId: cat.id,
-      note: 'Цель: ' + g.name,
-      goalId: g.id
+      id: uid(), type: 'expense', date: todayStr(), amount: amt,
+      accountId: accId, categoryId: cat.id, note: 'Цель: ' + g.name, goalId: g.id
     });
     if (!g.accountId) g.accountId = accId;
-    persist();
-    closeModal();
-    renderAll();
+    persist(); closeModal(); renderAll();
     toast('Цель пополнена на ' + fmt(amt, cur), 'ok');
   };
 }
 
-/* Модалка: вывести сумму из цели обратно на счёт */
 function withdrawGoalFundsModal(goalId) {
   const g = state.goals.find(x => x.id === goalId);
   if (!g) return;
@@ -616,25 +591,15 @@ function withdrawGoalFundsModal(goalId) {
 
   openModal(`
     <h2>Вывести из цели</h2>
-    <div class="field">
-      <label>Цель</label>
-      <input type="text" value="${g.name}" disabled>
-    </div>
-    <div class="field">
-      <label>Сумма вывода</label>
+    <div class="field"><label>Цель</label><input type="text" value="${g.name}" disabled></div>
+    <div class="field"><label>Сумма вывода</label>
       <input type="number" step="0.01" id="gw-amount" value="${balance.toFixed(2)}" placeholder="0.00">
-      <div class="hint">В цели доступно: ${fmt(balance)}</div>
-    </div>
-    <div class="field">
-      <label>На счёт</label>
-      <select id="gw-account">${accOpts}</select>
-    </div>
+      <div class="hint">В цели доступно: ${fmt(balance)}</div></div>
+    <div class="field"><label>На счёт</label><select id="gw-account">${accOpts}</select></div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="gw-save-btn">Вывести</button>
-    </div>
-  `);
-
+    </div>`);
   setTimeout(() => {
     const inp = document.getElementById('gw-amount');
     if (inp) { inp.focus(); inp.select(); }
@@ -644,28 +609,19 @@ function withdrawGoalFundsModal(goalId) {
     const amt = parseFloat(document.getElementById('gw-amount').value);
     const accId = document.getElementById('gw-account').value;
     if (!(amt > 0)) { toast('Укажите корректную сумму', 'err'); return; }
-    if (amt > balance) { toast('Сумма больше накоплений в цели', 'err'); return; }
+    if (amt > balance) { toast('Сумма больше накоплений', 'err'); return; }
     const acc = accById(accId);
-    if (!acc) { toast('Счёт не найден', 'err'); return; }
+    if (!acc) return;
     const cat = getGoalCategory();
     state.transactions.push({
-      id: uid(),
-      type: 'income',
-      date: todayStr(),
-      amount: amt,
-      accountId: accId,
-      categoryId: cat.id,
-      note: 'Возврат из цели: ' + g.name,
-      goalId: g.id
+      id: uid(), type: 'income', date: todayStr(), amount: amt,
+      accountId: accId, categoryId: cat.id, note: 'Возврат из цели: ' + g.name, goalId: g.id
     });
-    persist();
-    closeModal();
-    renderAll();
+    persist(); closeModal(); renderAll();
     toast('Возвращено на ' + acc.name + ': ' + fmt(amt, acc.currency || base), 'ok');
   };
 }
 
-/* Форма создания/редактирования цели — добавим поле "Счёт по умолчанию" */
 function goalFormNative(goal) {
   const g = goal || {
     name: '', targetAmount: '', initialAmount: 0, deadline: '',
@@ -682,7 +638,7 @@ function goalFormNative(goal) {
 
   return `
     <h2>${goal ? 'Изменить цель' : 'Новая цель'}</h2>
-    <div class="field"><label>Название</label><input type="text" id="g-name" value="${g.name}" placeholder="напр. Отпуск на море"></div>
+    <div class="field"><label>Название</label><input type="text" id="g-name" value="${g.name}"></div>
     <div class="field-row">
       <div class="field"><label>Целевая сумма</label><input type="number" step="0.01" id="g-target" value="${g.targetAmount}"></div>
       <div class="field"><label>Стартовая сумма</label><input type="number" step="0.01" id="g-initial" value="${initialVal}"></div>
@@ -699,14 +655,12 @@ function goalFormNative(goal) {
 function openGoalModalNative(goal) {
   openModal(goalFormNative(goal));
   let color = goal ? goal.color : ((typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a');
-
   document.getElementById('g-color').addEventListener('click', e => {
     if (e.target.dataset.c) {
       color = e.target.dataset.c;
       document.querySelectorAll('#g-color .sw').forEach(s => s.classList.toggle('sel', s.dataset.c === color));
     }
   });
-
   document.getElementById('g-save-btn').onclick = () => {
     const name = document.getElementById('g-name').value.trim();
     const targetAmount = parseFloat(document.getElementById('g-target').value);
@@ -733,21 +687,18 @@ function openGoalModalNative(goal) {
 /* ============================================================
    PORTFOLIO / CRYPTO — покупка и продажа со счёта
    ============================================================ */
-
 function getPortfolioCategory() {
-  let cat = state.categories.find(c => c.name === 'Портфель' && c.kind === 'expense');
+  let cat = state.categories.find(c => c.name === PORTFOLIO_CAT_NAME && c.kind === 'expense');
   if (!cat) {
-    cat = { id: 'portfolio_cat_auto', name: 'Портфель', color: '#15f211', kind: 'expense' };
+    cat = { id: 'portfolio_cat_auto', name: PORTFOLIO_CAT_NAME, color: '#15f211', kind: 'expense' };
     state.categories.push(cat);
   }
   return cat;
 }
 
-/* Резерв чтения значений модалок */
 const __stockModalRead  = { payAccId: null, shares: null, price: null, ticker: null };
 const __cryptoModalRead = { payAccId: null, amount: null, price: null, ticker: null };
 
-/* Расширяем модалку "Новая позиция (акции)" полем "Списать со счёта" */
 function enhanceStockModal() {
   if (document.getElementById('sp-payacc-field')) return;
   const modal = document.getElementById('modal');
@@ -755,7 +706,6 @@ function enhanceStockModal() {
   const saveBtn = document.getElementById('sp-save-btn');
   if (!saveBtn) return;
 
-  // В режиме редактирования ничего не делаем
   const h2 = modal.querySelector('h2');
   if (h2 && /Изменить/i.test(h2.textContent)) return;
 
@@ -775,12 +725,10 @@ function enhanceStockModal() {
   field.innerHTML = `
     <label>Списать со счёта</label>
     <select id="sp-payacc">${opts}</select>
-    <div class="hint">Сумма = кол-во × цена. Спишется с выбранного счёта (категория «Портфель»).</div>
-  `;
+    <div class="hint">Сумма = кол-во × цена. Спишется с выбранного счёта (категория «Портфель»).</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
 
-  // Capture — читаем ДО того как сработает валидатор + сохранение
   saveBtn.addEventListener('click', () => {
     __stockModalRead.payAccId = (document.getElementById('sp-payacc') || {}).value || null;
     __stockModalRead.shares  = parseFloat((document.getElementById('sp-shares') || {}).value) || 0;
@@ -788,20 +736,16 @@ function enhanceStockModal() {
     __stockModalRead.ticker  = ((document.getElementById('sp-ticker') || {}).value || '').trim().toUpperCase();
   }, true);
 
-  // Bubble — ждём закрытия модалки, создаём транзакцию
   saveBtn.addEventListener('click', () => {
     setTimeout(() => {
-      if (document.getElementById('overlay').classList.contains('active')) return; // не сохранилось
+      if (document.getElementById('overlay').classList.contains('active')) return;
       const v = __stockModalRead;
       if (!v.payAccId || !v.shares || !v.price || !v.ticker) return;
       const cat = getPortfolioCategory();
       state.transactions.push({
-        id: uid(),
-        type: 'expense',
-        date: todayStr(),
+        id: uid(), type: 'expense', date: todayStr(),
         amount: v.shares * v.price,
-        accountId: v.payAccId,
-        categoryId: cat.id,
+        accountId: v.payAccId, categoryId: cat.id,
         note: 'Покупка ' + v.ticker
       });
       persist();
@@ -811,7 +755,6 @@ function enhanceStockModal() {
   });
 }
 
-/* Расширяем модалку "Новая позиция (крипта)" полем "Списать со счёта" */
 function enhanceCryptoModal() {
   if (document.getElementById('crypto-payacc-field')) return;
   const modal = document.getElementById('modal');
@@ -838,8 +781,7 @@ function enhanceCryptoModal() {
   field.innerHTML = `
     <label>Списать со счёта</label>
     <select id="crypto-payacc">${opts}</select>
-    <div class="hint">Сумма = кол-во × цена. Спишется с выбранного счёта.</div>
-  `;
+    <div class="hint">Сумма = кол-во × цена. Спишется с выбранного счёта.</div>`;
   const actions = modal.querySelector('.modal-actions');
   if (actions) actions.parentNode.insertBefore(field, actions);
 
@@ -857,12 +799,9 @@ function enhanceCryptoModal() {
       if (!v.payAccId || !v.amount || !v.price || !v.ticker) return;
       const cat = getPortfolioCategory();
       state.transactions.push({
-        id: uid(),
-        type: 'expense',
-        date: todayStr(),
+        id: uid(), type: 'expense', date: todayStr(),
         amount: v.amount * v.price,
-        accountId: v.payAccId,
-        categoryId: cat.id,
+        accountId: v.payAccId, categoryId: cat.id,
         note: 'Покупка ' + v.ticker
       });
       persist();
@@ -872,7 +811,6 @@ function enhanceCryptoModal() {
   });
 }
 
-/* Продажа акций */
 function sellStockModal(accId, holdId) {
   const acc = accById(accId);
   if (!acc || acc.type !== 'stocks') return;
@@ -894,28 +832,19 @@ function sellStockModal(accId, holdId) {
 
   openModal(`
     <h2>Продать ${hold.ticker}</h2>
-    <div class="field">
-      <label>В наличии</label>
-      <input type="text" value="${hold.shares} шт · по ${fmt(hold.buyPrice, cur)}" disabled>
-    </div>
-    <div class="field">
-      <label>Количество к продаже</label>
-      <input type="number" step="any" id="ss-shares" value="${hold.shares}" max="${hold.shares}">
-    </div>
-    <div class="field">
-      <label>Цена за единицу (${cur})</label>
-      <input type="number" step="any" id="ss-price" value="${priceDefault}">
-    </div>
-    <div class="field">
-      <label>Зачислить на счёт</label>
-      <select id="ss-account">${opts}</select>
-    </div>
+    <div class="field"><label>В наличии</label>
+      <input type="text" value="${hold.shares} шт · по ${fmt(hold.buyPrice, cur)}" disabled></div>
+    <div class="field"><label>Количество к продаже</label>
+      <input type="number" step="any" id="ss-shares" value="${hold.shares}" max="${hold.shares}"></div>
+    <div class="field"><label>Цена за единицу (${cur})</label>
+      <input type="number" step="any" id="ss-price" value="${priceDefault}"></div>
+    <div class="field"><label>Зачислить на счёт</label>
+      <select id="ss-account">${opts}</select></div>
     <div class="hint">Деньги придут на выбранный счёт. В портфеле позиция уменьшится.</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="ss-save-btn">Продать</button>
-    </div>
-  `);
+    </div>`);
 
   document.getElementById('ss-save-btn').onclick = () => {
     const sharesToSell = parseFloat(document.getElementById('ss-shares').value);
@@ -934,23 +863,17 @@ function sellStockModal(accId, holdId) {
 
     const cat = getPortfolioCategory();
     state.transactions.push({
-      id: uid(),
-      type: 'income',
-      date: todayStr(),
+      id: uid(), type: 'income', date: todayStr(),
       amount: sharesToSell * price,
-      accountId: destAccId,
-      categoryId: cat.id,
+      accountId: destAccId, categoryId: cat.id,
       note: 'Продажа ' + hold.ticker
     });
 
-    persist();
-    closeModal();
-    renderAll();
+    persist(); closeModal(); renderAll();
     toast('Продано на ' + fmt(sharesToSell * price, dest.currency || base), 'ok');
   };
 }
 
-/* Продажа крипты */
 function sellCryptoModal(accId, holdId) {
   const acc = accById(accId);
   if (!acc || acc.type !== 'crypto') return;
@@ -973,28 +896,19 @@ function sellCryptoModal(accId, holdId) {
 
   openModal(`
     <h2>Продать ${hold.ticker}</h2>
-    <div class="field">
-      <label>В наличии</label>
-      <input type="text" value="${hold.amount} ${hold.ticker}" disabled>
-    </div>
-    <div class="field">
-      <label>Количество к продаже</label>
-      <input type="number" step="any" id="sc-amount" value="${hold.amount}" max="${hold.amount}">
-    </div>
-    <div class="field">
-      <label>Цена за единицу (${cur})</label>
-      <input type="number" step="any" id="sc-price" value="${priceDefault}">
-    </div>
-    <div class="field">
-      <label>Зачислить на счёт</label>
-      <select id="sc-account">${opts}</select>
-    </div>
+    <div class="field"><label>В наличии</label>
+      <input type="text" value="${hold.amount} ${hold.ticker}" disabled></div>
+    <div class="field"><label>Количество к продаже</label>
+      <input type="number" step="any" id="sc-amount" value="${hold.amount}" max="${hold.amount}"></div>
+    <div class="field"><label>Цена за единицу (${cur})</label>
+      <input type="number" step="any" id="sc-price" value="${priceDefault}"></div>
+    <div class="field"><label>Зачислить на счёт</label>
+      <select id="sc-account">${opts}</select></div>
     <div class="hint">Деньги придут на счёт. Позиция уменьшится.</div>
     <div class="modal-actions">
       <button class="btn secondary" onclick="closeModal()">Отмена</button>
       <button class="btn" id="sc-save-btn">Продать</button>
-    </div>
-  `);
+    </div>`);
 
   document.getElementById('sc-save-btn').onclick = () => {
     const amtToSell = parseFloat(document.getElementById('sc-amount').value);
@@ -1014,25 +928,18 @@ function sellCryptoModal(accId, holdId) {
 
     const cat = getPortfolioCategory();
     state.transactions.push({
-      id: uid(),
-      type: 'income',
-      date: todayStr(),
+      id: uid(), type: 'income', date: todayStr(),
       amount: amtToSell * price,
-      accountId: destAccId,
-      categoryId: cat.id,
+      accountId: destAccId, categoryId: cat.id,
       note: 'Продажа ' + hold.ticker
     });
 
-    persist();
-    closeModal();
-    renderAll();
+    persist(); closeModal(); renderAll();
     toast('Продано на ' + fmt(amtToSell * price, dest.currency || base), 'ok');
   };
 }
 
-/* Инжект кнопок "Продать" (−) в строки таблиц */
 function injectSellButtons() {
-  // stocks
   document.querySelectorAll('#stocks-table tr').forEach(tr => {
     if (tr.dataset.sellWired) return;
     const ra = tr.querySelector('.row-actions');
@@ -1054,7 +961,6 @@ function injectSellButtons() {
     ra.insertBefore(btn, ra.firstChild);
   });
 
-  // crypto
   document.querySelectorAll('#crypto-portfolio-list tr').forEach(tr => {
     if (tr.dataset.sellWired) return;
     const ra = tr.querySelector('.row-actions');
@@ -1077,7 +983,6 @@ function injectSellButtons() {
   });
 }
 
-/* Хуки на openModal и renderAll */
 function hookPortfolioHooks() {
   if (typeof window.openModal === 'function' && !window.openModal.__portHooked) {
     const orig = window.openModal;
@@ -1105,7 +1010,7 @@ function hookPortfolioHooks() {
     window.renderAll.__portHooked = true;
   }
 }
-   
+
 /* ============================================================
    MOBILE MODE
    ============================================================ */
@@ -1648,8 +1553,8 @@ function boot() {
   hookPersist();
   hookDeleteTx();
   setupImmediatePush();
+  hookPortfolioHooks();
 
-  // Переопределяем рендеры и обработчики целей
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
   try { window.renderTransactions = renderTransactionsMobile; } catch (e) {}
   try { window.renderGoals = renderGoalsNative; } catch (e) {}
@@ -1716,6 +1621,10 @@ window.ghSync = {
     add: addGoalFundsModal,
     withdraw: withdrawGoalFundsModal,
     balance: computeGoalBalance
+  },
+  portfolio: {
+    sellStock: sellStockModal,
+    sellCrypto: sellCryptoModal
   }
 };
 
