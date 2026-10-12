@@ -1,6 +1,6 @@
 /* =============================================================
-   sync.js — Multi-account + session + GitHub sync + Mobile v4
-   v4: push на save/edit/delete + phone only simple mode + gear
+   sync.js — Multi-account + GitHub sync + Mobile v5
+   v5: пополнение целей со счёта, вывод обратно
    ============================================================= */
 (function () {
 'use strict';
@@ -14,6 +14,7 @@ const GH_PREFIX       = 'budget_gh_';
 const GH_API          = 'https://api.github.com';
 const ACCOUNTS_FILE   = 'accounts.json';
 const MOBILE_MODE_KEY = 'budget_mobile_mode_v1';
+const GOAL_CAT_NAME   = 'Цели';
 
 let currentUser = null;
 let ghSha = null;
@@ -284,7 +285,6 @@ function hookPersist() {
   window.persist.__ghHooked = true;
 }
 
-/* Hook deleteTx — после confirm и persist — мгновенный push */
 function hookDeleteTx() {
   if (typeof window.deleteTx !== 'function') { setTimeout(hookDeleteTx, 300); return; }
   if (window.deleteTx.__ghHooked) return;
@@ -297,7 +297,6 @@ function hookDeleteTx() {
   window.deleteTx.__ghHooked = true;
 }
 
-/* Клики по кнопкам сохранения — мгновенный push */
 function setupImmediatePush() {
   if (setupImmediatePush.__wired) return;
   setupImmediatePush.__wired = true;
@@ -315,8 +314,6 @@ function setupImmediatePush() {
     const delBtn     = t.closest('[onclick*="deleteTx"]');
 
     if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !delBtn) return;
-
-    // 200 мс — даём index.html записать state и persist
     setTimeout(() => triggerImmediatePush(saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data')), 200);
   }, false);
 }
@@ -462,7 +459,279 @@ function renderTransactionsMobile() {
 }
 
 /* ============================================================
-   MOBILE MODE — только простой вид, + маленькая ⚙ для настроек
+   GOALS — пополнение со счёта
+   ============================================================ */
+function computeGoalBalance(g) {
+  const initial = Number(g.initialAmount || 0);
+  let fromTx = 0;
+  state.transactions.forEach(t => {
+    if (t.goalId === g.id) {
+      if (t.type === 'expense') fromTx += t.amount;
+      else if (t.type === 'income') fromTx -= t.amount;
+    }
+  });
+  return initial + fromTx;
+}
+
+function getGoalCategory() {
+  let cat = state.categories.find(c => c.name === GOAL_CAT_NAME && c.kind === 'expense');
+  if (!cat) {
+    cat = { id: 'goal_cat_' + Math.random().toString(36).slice(2, 8), name: GOAL_CAT_NAME, color: '#8b93a1', kind: 'expense' };
+    state.categories.push(cat);
+  }
+  return cat;
+}
+
+function accountsForGoal() {
+  return state.accounts.filter(a => a.type === 'cash' || a.type === 'bank');
+}
+
+function renderGoalsNative() {
+  const grid = document.getElementById('goals-grid');
+  if (!grid) return;
+  if (state.goals.length === 0) {
+    grid.innerHTML = `<div class="empty" style="grid-column:1/-1"><div class="big">◎</div>Пока нет целей</div>`;
+    return;
+  }
+  grid.innerHTML = state.goals.map(g => {
+    const bal = computeGoalBalance(g);
+    const pct = Math.min(100, (bal / g.targetAmount) * 100);
+    const daysLeft = g.deadline ? Math.ceil((new Date(g.deadline) - new Date()) / 86400000) : null;
+    const acc = g.accountId ? accById(g.accountId) : null;
+    const accLine = acc
+      ? `<div class="meta" style="font-size:11.5px;color:var(--text-dim);margin-top:4px;">счёт: ${acc.name}</div>`
+      : `<div class="meta" style="font-size:11.5px;color:var(--text-dim);margin-top:4px;">счёт: любой</div>`;
+    return `<div class="acc-card" style="--c:${g.color}">
+      <div class="head">
+        <div><div class="name">${g.name}</div><div class="type">${g.deadline ? 'до ' + g.deadline : 'без срока'}</div></div>
+        <div class="row-actions" style="opacity:1;">
+          <button class="icon-btn" onclick="editGoal('${g.id}')">✎</button>
+          <button class="icon-btn" onclick="deleteGoal('${g.id}')">✕</button>
+        </div>
+      </div>
+      <div class="bal">${fmt(bal)} <span style="font-size:13px;color:var(--text-dim);font-weight:400;">/ ${fmt(g.targetAmount)}</span></div>
+      <div style="height:8px"></div>
+      <div class="bar-track"><div class="bar-fill" style="width:${pct}%;background:${g.color}"></div></div>
+      <div class="meta" style="margin-top:8px;">${pct.toFixed(0)}% ${daysLeft != null ? (daysLeft >= 0 ? `· ${daysLeft} дн. осталось` : '· срок прошёл') : ''}</div>
+      ${accLine}
+      <div class="foot" style="gap:6px;flex-wrap:wrap;">
+        <button class="btn ghost small" onclick="addGoalFunds('${g.id}')">+ Внести</button>
+        <button class="btn ghost small" onclick="withdrawGoalFunds('${g.id}')">− Вывести</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+
+/* Модалка: внести сумму в цель */
+function addGoalFundsModal(goalId) {
+  const g = state.goals.find(x => x.id === goalId);
+  if (!g) return;
+  const accs = accountsForGoal();
+  if (accs.length === 0) {
+    if (typeof toast === 'function') toast('Нет доступных счетов (нужен наличный или банковский)', 'err');
+    return;
+  }
+  const base = state.settings.baseCurrency;
+  const accOpts = accs.map(a => {
+    const cur = a.currency || base;
+    const bal = cashAccountBalance(a);
+    const sel = (g.accountId === a.id) ? 'selected' : '';
+    return `<option value="${a.id}" ${sel}>${a.name} — ${fmt(bal, cur)}</option>`;
+  }).join('');
+
+  const current = computeGoalBalance(g);
+  const remain = Math.max(0, g.targetAmount - current);
+
+  openModal(`
+    <h2>Пополнить цель</h2>
+    <div class="field">
+      <label>Цель</label>
+      <input type="text" value="${g.name}" disabled>
+    </div>
+    <div class="field">
+      <label>Сумма пополнения</label>
+      <input type="number" step="0.01" id="gf-amount" value="${remain > 0 ? remain.toFixed(2) : ''}" placeholder="0.00">
+    </div>
+    <div class="field">
+      <label>Со счёта</label>
+      <select id="gf-account">${accOpts}</select>
+      <div class="hint">Сумма спишется со счёта и попадёт в накопления цели.</div>
+    </div>
+    <div class="hint">Уже накоплено: <strong>${fmt(current)}</strong> из ${fmt(g.targetAmount)}</div>
+    <div class="modal-actions">
+      <button class="btn secondary" onclick="closeModal()">Отмена</button>
+      <button class="btn" id="gf-save-btn">Внести</button>
+    </div>
+  `);
+
+  setTimeout(() => {
+    const inp = document.getElementById('gf-amount');
+    if (inp) { inp.focus(); inp.select(); }
+  }, 100);
+
+  document.getElementById('gf-save-btn').onclick = () => {
+    const amt = parseFloat(document.getElementById('gf-amount').value);
+    const accId = document.getElementById('gf-account').value;
+    if (!(amt > 0)) { toast('Укажите корректную сумму', 'err'); return; }
+    const acc = accById(accId);
+    if (!acc) { toast('Счёт не найден', 'err'); return; }
+    const cur = acc.currency || base;
+    const bal = cashAccountBalance(acc);
+    if (bal < amt) {
+      if (!confirm(`На счёте «${acc.name}» только ${fmt(bal, cur)}. Продолжить?`)) return;
+    }
+    const cat = getGoalCategory();
+    state.transactions.push({
+      id: uid(),
+      type: 'expense',
+      date: todayStr(),
+      amount: amt,
+      accountId: accId,
+      categoryId: cat.id,
+      note: 'Цель: ' + g.name,
+      goalId: g.id
+    });
+    if (!g.accountId) g.accountId = accId;
+    persist();
+    closeModal();
+    renderAll();
+    toast('Цель пополнена на ' + fmt(amt, cur), 'ok');
+  };
+}
+
+/* Модалка: вывести сумму из цели обратно на счёт */
+function withdrawGoalFundsModal(goalId) {
+  const g = state.goals.find(x => x.id === goalId);
+  if (!g) return;
+  const balance = computeGoalBalance(g);
+  if (balance <= 0) { toast('В цели нет накоплений', 'err'); return; }
+  const accs = accountsForGoal();
+  if (accs.length === 0) { toast('Нет доступных счетов', 'err'); return; }
+  const base = state.settings.baseCurrency;
+  const accOpts = accs.map(a => {
+    const cur = a.currency || base;
+    const sel = (g.accountId === a.id) ? 'selected' : '';
+    return `<option value="${a.id}" ${sel}>${a.name} (${cur})</option>`;
+  }).join('');
+
+  openModal(`
+    <h2>Вывести из цели</h2>
+    <div class="field">
+      <label>Цель</label>
+      <input type="text" value="${g.name}" disabled>
+    </div>
+    <div class="field">
+      <label>Сумма вывода</label>
+      <input type="number" step="0.01" id="gw-amount" value="${balance.toFixed(2)}" placeholder="0.00">
+      <div class="hint">В цели доступно: ${fmt(balance)}</div>
+    </div>
+    <div class="field">
+      <label>На счёт</label>
+      <select id="gw-account">${accOpts}</select>
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" onclick="closeModal()">Отмена</button>
+      <button class="btn" id="gw-save-btn">Вывести</button>
+    </div>
+  `);
+
+  setTimeout(() => {
+    const inp = document.getElementById('gw-amount');
+    if (inp) { inp.focus(); inp.select(); }
+  }, 100);
+
+  document.getElementById('gw-save-btn').onclick = () => {
+    const amt = parseFloat(document.getElementById('gw-amount').value);
+    const accId = document.getElementById('gw-account').value;
+    if (!(amt > 0)) { toast('Укажите корректную сумму', 'err'); return; }
+    if (amt > balance) { toast('Сумма больше накоплений в цели', 'err'); return; }
+    const acc = accById(accId);
+    if (!acc) { toast('Счёт не найден', 'err'); return; }
+    const cat = getGoalCategory();
+    state.transactions.push({
+      id: uid(),
+      type: 'income',
+      date: todayStr(),
+      amount: amt,
+      accountId: accId,
+      categoryId: cat.id,
+      note: 'Возврат из цели: ' + g.name,
+      goalId: g.id
+    });
+    persist();
+    closeModal();
+    renderAll();
+    toast('Возвращено на ' + acc.name + ': ' + fmt(amt, acc.currency || base), 'ok');
+  };
+}
+
+/* Форма создания/редактирования цели — добавим поле "Счёт по умолчанию" */
+function goalFormNative(goal) {
+  const g = goal || {
+    name: '', targetAmount: '', initialAmount: 0, deadline: '',
+    color: (typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a',
+    accountId: ''
+  };
+  const palette = (typeof PALETTE !== 'undefined') ? PALETTE : ['#d4a54a', '#4fbf8b', '#e36565', '#6fa8d6'];
+  const swatches = palette.map(c => `<div class="sw ${g.color === c ? 'sel' : ''}" data-c="${c}" style="background:${c}"></div>`).join('');
+  const accs = accountsForGoal();
+  const accOpts = ['<option value="">— выбрать при пополнении —</option>']
+    .concat(accs.map(a => `<option value="${a.id}" ${g.accountId === a.id ? 'selected' : ''}>${a.name}</option>`))
+    .join('');
+  const initialVal = (goal && (goal.initialAmount != null ? goal.initialAmount : goal.currentAmount)) || 0;
+
+  return `
+    <h2>${goal ? 'Изменить цель' : 'Новая цель'}</h2>
+    <div class="field"><label>Название</label><input type="text" id="g-name" value="${g.name}" placeholder="напр. Отпуск на море"></div>
+    <div class="field-row">
+      <div class="field"><label>Целевая сумма</label><input type="number" step="0.01" id="g-target" value="${g.targetAmount}"></div>
+      <div class="field"><label>Стартовая сумма</label><input type="number" step="0.01" id="g-initial" value="${initialVal}"></div>
+    </div>
+    <div class="field"><label>Счёт по умолчанию</label><select id="g-account">${accOpts}</select></div>
+    <div class="field"><label>Срок (необязательно)</label><input type="date" id="g-deadline" value="${g.deadline || ''}"></div>
+    <div class="field"><label>Цвет</label><div class="color-swatches" id="g-color">${swatches}</div></div>
+    <div class="modal-actions">
+      <button class="btn secondary" onclick="closeModal()">Отмена</button>
+      <button class="btn" id="g-save-btn">Сохранить</button>
+    </div>`;
+}
+
+function openGoalModalNative(goal) {
+  openModal(goalFormNative(goal));
+  let color = goal ? goal.color : ((typeof PALETTE !== 'undefined') ? PALETTE[0] : '#d4a54a');
+
+  document.getElementById('g-color').addEventListener('click', e => {
+    if (e.target.dataset.c) {
+      color = e.target.dataset.c;
+      document.querySelectorAll('#g-color .sw').forEach(s => s.classList.toggle('sel', s.dataset.c === color));
+    }
+  });
+
+  document.getElementById('g-save-btn').onclick = () => {
+    const name = document.getElementById('g-name').value.trim();
+    const targetAmount = parseFloat(document.getElementById('g-target').value);
+    if (!name || !targetAmount) { toast('Заполните название и целевую сумму', 'err'); return; }
+    const initial = parseFloat(document.getElementById('g-initial').value) || 0;
+    const accountId = document.getElementById('g-account').value || '';
+    const deadline = document.getElementById('g-deadline').value || '';
+    const payload = {
+      id: goal ? goal.id : uid(),
+      name, targetAmount, initialAmount: initial,
+      deadline, color, accountId
+    };
+    if (goal) {
+      const idx = state.goals.findIndex(x => x.id === goal.id);
+      state.goals[idx] = Object.assign({}, state.goals[idx], payload);
+    } else {
+      state.goals.push(payload);
+    }
+    persist(); closeModal(); renderAll();
+    toast('Цель сохранена', 'ok');
+  };
+}
+
+/* ============================================================
+   MOBILE MODE
    ============================================================ */
 function isMobileDevice() {
   if (window.matchMedia && window.matchMedia('(max-width: 760px)').matches) return true;
@@ -470,7 +739,6 @@ function isMobileDevice() {
 }
 function isMobileMode() {
   if (!isMobileDevice()) return false;
-  // на телефоне всегда простой вид. Отключается только через консоль
   return localStorage.getItem(MOBILE_MODE_KEY) !== 'off';
 }
 function setMobileMode(on) {
@@ -591,10 +859,6 @@ function injectMobileCSS() {
     }
     #mobile-gear.on { display: flex; }
     #mobile-gear:active { transform: scale(.94); }
-    body.mobile-mode.show-settings #mobile-gear {
-      background: #F4A83D; color: #fff; border-color: #F4A83D;
-      font-size: 22px;
-    }
 
     @media (max-width: 760px) {
       .overlay { padding: 10px; align-items: flex-end !important; }
@@ -657,7 +921,6 @@ function injectMobileCSS() {
 }
 
 function injectMobileUI() {
-  // FAB — кнопка добавления
   if (!document.getElementById('mobile-fab')) {
     const fab = document.createElement('button');
     fab.id = 'mobile-fab';
@@ -667,7 +930,6 @@ function injectMobileUI() {
     fab.onclick = () => { if (typeof openTxModal === 'function') openTxModal(null); };
     document.body.appendChild(fab);
   }
-  // Gear — переход в настройки / назад
   if (!document.getElementById('mobile-gear')) {
     const gear = document.createElement('button');
     gear.id = 'mobile-gear';
@@ -677,13 +939,11 @@ function injectMobileUI() {
     gear.onclick = () => {
       const settingsActive = document.getElementById('view-settings').classList.contains('active');
       if (settingsActive) {
-        document.body.classList.remove('show-settings');
         if (typeof showView === 'function') showView('transactions');
       } else {
-        document.body.classList.add('show-settings');
         if (typeof showView === 'function') showView('settings');
       }
-      updateMobileChrome();
+      setTimeout(updateMobileChrome, 30);
     };
     document.body.appendChild(gear);
   }
@@ -695,12 +955,8 @@ function updateMobileChrome() {
   if (!gear || !fab) return;
   const settingsActive = document.getElementById('view-settings').classList.contains('active');
   gear.textContent = settingsActive ? '←' : '⚙';
-  // FAB скрываем на странице настроек
-  if (settingsActive) {
-    fab.classList.remove('on');
-  } else {
-    fab.classList.add('on');
-  }
+  if (settingsActive) fab.classList.remove('on');
+  else fab.classList.add('on');
 }
 
 function applyMobileMode() {
@@ -726,8 +982,6 @@ function applyMobileMode() {
       if (!cur) showView('transactions');
     }
   }
-
-  // Пересобрать индекс кнопок в зависимости от активной вью
   updateMobileChrome();
 }
 
@@ -771,9 +1025,6 @@ function authHtml() {
           <input type="password" id="rg-pass2" autocomplete="new-password" style="width:100%;background:var(--bg-elev-2,#F2EDE3);border:1px solid var(--border,#EAE2D3);color:var(--text,#2B2620);padding:11px 14px;border-radius:12px;font-size:16px;box-sizing:border-box;">
         </div>
         <button id="rg-submit" style="width:100%;background:#F4A83D;color:#fff;border:none;padding:14px 18px;border-radius:13px;font-weight:600;font-size:14.5px;cursor:pointer;box-shadow:0 3px 10px rgba(244,168,61,.28);min-height:50px;">Создать аккаунт</button>
-        <div style="font-size:11.5px;color:var(--text-dim,#968F80);text-align:center;margin-top:14px;line-height:1.5;">
-          После регистрации: Настройки → GitHub Sync → настройте токен,<br>тогда аккаунт появится на других устройствах.
-        </div>
       </div>
       <div id="auth-err" style="color:#F2545B;font-size:12.5px;margin-top:12px;text-align:center;min-height:16px;"></div>
     </div>
@@ -1022,8 +1273,15 @@ function boot() {
   hookDeleteTx();
   setupImmediatePush();
 
+  // Переопределяем рендеры и обработчики целей
   try { window.renderAccounts = renderAccountsNative; } catch (e) {}
   try { window.renderTransactions = renderTransactionsMobile; } catch (e) {}
+  try { window.renderGoals = renderGoalsNative; } catch (e) {}
+  try { window.addGoalFunds = addGoalFundsModal; } catch (e) {}
+  try { window.withdrawGoalFunds = withdrawGoalFundsModal; } catch (e) {}
+  try { window.openGoalModal = openGoalModalNative; } catch (e) {}
+  try { window.editGoal = function(id){ openGoalModalNative(state.goals.find(g => g.id === id)); }; } catch (e) {}
+
   if (typeof renderAll === 'function') { try { renderAll(); } catch (e) {} }
 
   setTimeout(() => { applyMobileMode(); }, 250);
@@ -1033,7 +1291,6 @@ function boot() {
     if (!document.getElementById('gh-sync-card')) injectGithubCard();
   }, 1500);
 
-  // подписаться на showView чтобы кнопка ⚙/← менялась
   if (typeof window.showView === 'function' && !window.showView.__ghHooked) {
     const origShow = window.showView;
     window.showView = function (id) {
@@ -1078,6 +1335,11 @@ window.ghSync = {
     state: isMobileMode,
     off: () => setMobileMode(false),
     on: () => setMobileMode(true)
+  },
+  goals: {
+    add: addGoalFundsModal,
+    withdraw: withdrawGoalFundsModal,
+    balance: computeGoalBalance
   }
 };
 
