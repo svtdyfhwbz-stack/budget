@@ -1,5 +1,5 @@
 /* =============================================================
-   sync.js — v13 (full fix: deposits exposed to window)
+   sync.js — v14 (balance correction)
    ============================================================= */
 (function () {
 'use strict';
@@ -609,6 +609,86 @@ function closeDeposit(accId) {
   };
 }
 
+/* ---------- КОРРЕКЦИЯ БАЛАНСА ---------- */
+function getCorrectionCategory() {
+  let cat = state.categories.find(c => c.name === 'Корректировка');
+  if (!cat) {
+    cat = { id: 'correction_cat_' + Math.random().toString(36).slice(2, 8), name: 'Корректировка', color: '#8b93a1', kind: 'expense' };
+    state.categories.push(cat);
+  }
+  return cat;
+}
+
+function openBalanceCorrectionModal(accId) {
+  const acc = accById(accId);
+  if (!acc) { toast('Счёт не найден', 'err'); return; }
+  if (acc.type !== 'cash' && acc.type !== 'bank') {
+    toast('Коррекция доступна только для наличных и банковских счетов', 'err');
+    return;
+  }
+  const base = state.settings.baseCurrency;
+  const cur = acc.currency || base;
+  const currentBalance = cashAccountBalance(acc);
+
+  openModal(`
+    <h2>Корректировка баланса</h2>
+    <div class="field">
+      <label>Счёт</label>
+      <input type="text" value="${acc.name}" disabled>
+    </div>
+    <div class="field">
+      <label>Текущий баланс в приложении</label>
+      <input type="text" value="${fmt(currentBalance, cur)}" disabled>
+    </div>
+    <div class="field">
+      <label>Фактический баланс</label>
+      <input type="number" step="0.01" id="bc-new" value="${currentBalance.toFixed(2)}" placeholder="0.00">
+      <div class="hint">Введите сколько реально на счёте. Разница спишется или начислится как транзакция «Корректировка».</div>
+    </div>
+    <div class="field">
+      <label>Комментарий (необязательно)</label>
+      <input type="text" id="bc-note" placeholder="напр. расхождение с выпиской банка">
+    </div>
+    <div class="modal-actions">
+      <button class="btn secondary" onclick="closeModal()">Отмена</button>
+      <button class="btn" id="bc-save-btn">Применить</button>
+    </div>
+  `);
+
+  setTimeout(() => {
+    const inp = document.getElementById('bc-new');
+    if (inp) { inp.focus(); inp.select(); }
+  }, 100);
+
+  document.getElementById('bc-save-btn').onclick = () => {
+    const newBal = parseFloat(document.getElementById('bc-new').value);
+    if (!isFinite(newBal)) { toast('Укажите корректный баланс', 'err'); return; }
+    const diff = newBal - currentBalance;
+    if (Math.abs(diff) < 0.005) {
+      closeModal();
+      toast('Баланс уже совпадает — изменений нет', 'ok');
+      return;
+    }
+    const note = (document.getElementById('bc-note').value || '').trim();
+    const cat = getCorrectionCategory();
+    const type = diff > 0 ? 'income' : 'expense';
+    state.transactions.push({
+      id: uid(),
+      type,
+      date: todayStr(),
+      amount: Math.abs(diff),
+      accountId: accId,
+      categoryId: cat.id,
+      note: 'Корректировка баланса' + (note ? ': ' + note : '')
+    });
+    persist();
+    closeModal();
+    renderAll();
+    const sign = diff > 0 ? '+' : '−';
+    toast('Баланс скорректирован: ' + sign + fmt(Math.abs(diff), cur), 'ok');
+  };
+}
+
 /* ---------- render accounts ---------- */
 function renderAccountsNative() {
   const grid = document.getElementById('acc-grid');
@@ -651,6 +731,7 @@ function renderAccountsNative() {
       meta = `${(a.crypto && a.crypto.network) || ''} · валюта: ${nc} · ` + (addr ? addr.slice(0, 6) + '…' + addr.slice(-4) : 'адрес не указан');
     } else if (a.type === 'stocks') { meta = `${(a.holdings || []).length} позиций · валюта: ${nc}`; }
     else { meta = nc; }
+    const isCashOrBank = (a.type === 'cash' || a.type === 'bank');
     return `<div class="acc-card" style="--c:${a.color}">
       <div class="head">
         <div><div class="name">${a.name}</div><div class="type">${tL(a.type)}</div></div>
@@ -664,7 +745,8 @@ function renderAccountsNative() {
       <div class="meta">${meta}</div>
       <div class="foot">
         ${a.type === 'crypto' ? `<button class="btn ghost small" onclick="refreshCrypto('${a.id}')">↻ Обновить курс</button>` : ''}
-        ${a.type === 'stocks' ? `<button class="btn ghost small" onclick="showView('stocks')">Портфель →</button>` : '<span></span>'}
+        ${a.type === 'stocks' ? `<button class="btn ghost small" onclick="showView('stocks')">Портфель →</button>` : ''}
+        ${isCashOrBank ? `<button class="btn ghost small" onclick="window.openBalanceCorrectionModal('${a.id}')">⇄ Корректировать</button>` : ''}
       </div>
     </div>`;
   }).join('');
@@ -1318,9 +1400,10 @@ function setupImmediatePush() {
     const saveBudget = t.closest('#b-save-btn');
     const saveGoal = t.closest('#g-save-btn');
     const saveDeposit = t.closest('#d-save-btn');
+    const saveCorrection = t.closest('#bc-save-btn');
     const delBtn = t.closest('[onclick*="deleteTx"]');
-    if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !saveDeposit && !delBtn) return;
-    setTimeout(() => triggerImmediatePush(saveDeposit ? 'deposit' : (saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data'))), 200);
+    if (!saveTx && !saveAcc && !saveCat && !saveSub && !saveBudget && !saveGoal && !saveDeposit && !saveCorrection && !delBtn) return;
+    setTimeout(() => triggerImmediatePush(saveCorrection ? 'correction' : (saveDeposit ? 'deposit' : (saveTx ? 'tx-save' : (delBtn ? 'tx-delete' : 'data')))), 200);
   }, false);
 }
 
@@ -1668,7 +1751,6 @@ function boot() {
   try { window.editGoal = function(id){ openGoalModalNative(state.goals.find(g => g.id === id)); }; } catch (e) {}
   try { window.openCryptoHoldingModal = openCryptoHoldingModalNew; } catch (e) {}
 
-  // обёртка renderAll — рисует вклады
   try {
     const base = window.renderAll;
     if (base && !base.__depHook) {
@@ -1698,7 +1780,6 @@ function boot() {
   setTimeout(injectGithubCard, 400);
   setInterval(() => { if (!document.getElementById('gh-sync-card')) injectGithubCard(); }, 1500);
 
-  // обёртка showView — блок в мобильном
   if (typeof window.showView === 'function' && !window.showView.__ghHooked) {
     const origShow = window.showView;
     window.showView = function (id) {
@@ -1719,7 +1800,6 @@ function boot() {
     window.showView.__ghHooked = true;
   }
 
-  // FX
   setTimeout(async () => { await refreshAllFxRates(false); if (typeof renderAll === 'function') renderAll(); }, 700);
   startFxAutoRefresh();
   document.addEventListener('visibilitychange', () => {
@@ -1743,10 +1823,10 @@ if (document.readyState === 'loading') {
 }
 
 /* ============================================================
-   ГЛАВНОЕ: экспорт функций в window — чтобы inline onclick нашёл
+   ЭКСПОРТ В WINDOW — inline onclick находит функции здесь
    ============================================================ */
 
-// утилиты (нужны для inline onclick в карточках вкладов)
+// утилиты
 window.__accById = accById;
 window.__uid = uid;
 window.__todayStr = todayStr;
@@ -1757,6 +1837,10 @@ window.closeDeposit = closeDeposit;
 window.calcDeposit = calcDeposit;
 window.renderDeposits = renderDeposits;
 window.depositsList = depositsList;
+
+// коррекция баланса
+window.openBalanceCorrectionModal = openBalanceCorrectionModal;
+window.getCorrectionCategory = getCorrectionCategory;
 
 // крипта
 window.openCryptoHoldingModalNew = openCryptoHoldingModalNew;
@@ -1781,6 +1865,7 @@ window.ghSync = {
   },
   crypto: { search: searchCryptoLive, top: fetchCryptoTopList, openModal: openCryptoHoldingModalNew },
   deposits: { open: openDepositModal, close: closeDeposit, calc: calcDeposit, list: depositsList },
+  correction: { open: openBalanceCorrectionModal, category: getCorrectionCategory },
   goals: { add: addGoalFundsModal, withdraw: withdrawGoalFundsModal, balance: computeGoalBalance },
   portfolio: { sellStock: sellStockModal, sellCrypto: sellCryptoModal }
 };
