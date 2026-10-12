@@ -1895,8 +1895,18 @@ window.ghSync = {
   cfg: ghCfg,
   logout: logout,
   whoami: () => currentUser,
-  mobile: { state: isMobileMode, off: () => setMobileMode(false), on: () => setMobileMode(true), refresh: applyMobileMode },
-  fx: { refresh: () => refreshAllFxRates(true).then(r => { renderAll(); return r; }), convert: convertAmount, cache: loadFxCache, clearCache: () => { localStorage.removeItem(FX_CACHE_KEY); } },
+  mobile: {
+    state: isMobileMode,
+    off: () => setMobileMode(false),
+    on: () => setMobileMode(true),
+    refresh: applyMobileMode
+  },
+  fx: {
+    refresh: () => refreshAllFxRates(true).then(r => { renderAll(); return r; }),
+    convert: convertAmount,
+    cache: loadFxCache,
+    clearCache: () => { localStorage.removeItem(FX_CACHE_KEY); }
+  },
   crypto: {
     search: searchCryptoLive,
     top: fetchCryptoTopList,
@@ -1908,8 +1918,25 @@ window.ghSync = {
     calc: calcDeposit,
     list: depositsList
   },
-  goals: { add: addGoalFundsModal, withdraw: withdrawGoalFundsModal, balance: computeGoalBalance },
-  portfolio: { sellStock: sellStockModal, sellCrypto: sellCryptoModal }
+  goals: {
+    add: addGoalFundsModal,
+    withdraw: withdrawGoalFundsModal,
+    balance: computeGoalBalance
+  },
+  portfolio: {
+    sellStock: sellStockModal,
+    sellCrypto: sellCryptoModal
+  }
 };
+
+/* === ЭТИ СТРОКИ ДОБАВЬ === */
+try { window.openDepositModal = openDepositModal; } catch (e) {}
+try { window.closeDeposit = closeDeposit; } catch (e) {}
+try { window.calcDeposit = calcDeposit; } catch (e) {}
+try { window.renderDeposits = renderDeposits; } catch (e) {}
+try { window.depositsList = depositsList; } catch (e) {}
+try { window.openCryptoHoldingModalNew = openCryptoHoldingModalNew; } catch (e) {}
+try { window.searchCryptoLive = searchCryptoLive; } catch (e) {}
+try { window.fetchCryptoTopList = fetchCryptoTopList; } catch (e) {}
 
 })();
